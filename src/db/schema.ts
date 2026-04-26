@@ -216,6 +216,80 @@ export const transactions = sqliteTable(
   ]
 );
 
+// ---- utxos (UTXO-family spendability overlay on top of `transactions`) ----
+//
+// `transactions` is the source of truth for on-chain facts: amount, status,
+// confirmations, txHash, vout (carried in `logIndex`), invoice link, reorg
+// state. For UTXO-family chains we also need to track which outputs are
+// CURRENTLY SPENDABLE — i.e. confirmed and not yet consumed by an outgoing
+// payout. This table is that overlay.
+//
+// Each row maps 1:1 to a `transactions` row that paid one of our addresses
+// (FK enforces this). The row carries the UTXO-specific bookkeeping we need
+// at coin-selection / sign time:
+//
+//   - `script_pubkey` — the scriptPubKey we'd be spending; used to compute
+//     witness-v0 sighash without re-deriving from the address every time.
+//   - `address_index` — BIP44 index for HD private-key derivation when
+//     building the input's witness signature. Snapshotted from the invoice
+//     row at ingest so payout signing doesn't need a join back to invoices.
+//   - `value_sats` — raw output value (decimal string for libSQL — uint64
+//     doesn't fit JS number). Coin selection orders by this.
+//   - `spent_in_payout_id` — NULL until a payout consumes the UTXO; set in
+//     the same DB tx as the broadcast attempt so a crash mid-flight either
+//     never reserves the UTXO (clean retry) or marks it spent atomically.
+//
+// Confirmation state lives on `transactions.status` (NOT duplicated here):
+// the spendable index pairs with `transactions.status='confirmed'` at query
+// time. Reorg-recheck flips the parent tx to 'orphaned' → coinselect's
+// JOIN naturally excludes the affected utxo. No separate orphan flag needed
+// on this table.
+//
+// Non-UTXO-family chains (EVM, Tron, Solana) do NOT write to this table.
+export const utxos = sqliteTable(
+  "utxos",
+  {
+    // "{txHash}:{vout}" — globally unique outpoint identifier.
+    id: text("id").primaryKey(),
+    transactionId: text("transaction_id")
+      .notNull()
+      .references(() => transactions.id),
+    chainId: integer("chain_id").notNull(),
+    // Our owned address holding this output. Canonical (lowercase bech32).
+    address: text("address").notNull(),
+    // BIP44 index used to derive the private key. Snapshotted at ingest so
+    // signing doesn't need a join to invoices to recover it.
+    addressIndex: integer("address_index").notNull(),
+    // Output index within the parent tx (== `transactions.log_index` for the
+    // same row, denormalized for query convenience).
+    vout: integer("vout").notNull(),
+    valueSats: text("value_sats").notNull(),
+    // Hex-encoded scriptPubKey (P2WPKH = OP_0 <20-byte hash160>).
+    scriptPubkey: text("script_pubkey").notNull(),
+    // FK to payouts.id when consumed. NULL = spendable.
+    spentInPayoutId: text("spent_in_payout_id").references(() => payouts.id),
+    spentAt: integer("spent_at"),
+    createdAt: integer("created_at").notNull()
+  },
+  (t) => [
+    // One row per outpoint (chain_id is part of the key only because synthetic
+    // chainIds across families are independent; (transaction_id) alone is
+    // already unique because transactions.id is a UUID).
+    uniqueIndex("uq_utxos_outpoint").on(t.chainId, t.transactionId),
+    // Hot-path index for coin selection: scoped to a chain, partial on
+    // unspent. The address column is included so the query planner can
+    // fan addresses out for per-source coin selection without a heap lookup.
+    index("idx_utxos_spendable")
+      .on(t.chainId, t.spentInPayoutId, t.address)
+      .where(sql`${t.spentInPayoutId} IS NULL`),
+    // Reverse lookup for "show me all UTXOs that funded payout X" — used by
+    // admin reconciliation views and the gas-burn debit path.
+    index("idx_utxos_spent_in_payout")
+      .on(t.spentInPayoutId)
+      .where(sql`${t.spentInPayoutId} IS NOT NULL`)
+  ]
+);
+
 // ---- payout_reservations (active debits against an HD source address) ----
 //
 // The ledger treats every HD-derived address we control (`address_pool`
@@ -436,7 +510,7 @@ export const addressPool = sqliteTable(
   "address_pool",
   {
     id: text("id").primaryKey(),
-    family: text("family", { enum: ["evm", "tron", "solana"] }).notNull(),
+    family: text("family", { enum: ["evm", "tron", "solana", "utxo"] }).notNull(),
     addressIndex: integer("address_index").notNull(),
     // Canonical form — hex for EVM, base58 for Tron/Solana.
     address: text("address").notNull(),
@@ -483,7 +557,7 @@ export const addressPool = sqliteTable(
       t.addressIndex
     ),
     index("idx_address_pool_allocated").on(t.allocatedToInvoiceId),
-    check("address_pool_family_check", sql`${t.family} IN ('evm','tron','solana')`),
+    check("address_pool_family_check", sql`${t.family} IN ('evm','tron','solana','utxo')`),
     check(
       "address_pool_status_check",
       sql`${t.status} IN ('available','allocated','quarantined')`
@@ -519,7 +593,7 @@ export const feeWallets = sqliteTable(
   "fee_wallets",
   {
     id: text("id").primaryKey(),
-    family: text("family", { enum: ["evm", "tron", "solana"] }).notNull(),
+    family: text("family", { enum: ["evm", "tron", "solana", "utxo"] }).notNull(),
     mode: text("mode", { enum: ["hd-pool", "imported"] }).notNull(),
     // Canonical address form — matches the corresponding chain adapter's
     // canonicalizeAddress output. For hd-pool mode this MUST equal an
@@ -537,7 +611,7 @@ export const feeWallets = sqliteTable(
   (t) => [
     // At most one fee wallet per family. Operator swaps by DELETE + re-POST.
     uniqueIndex("uq_fee_wallets_family").on(t.family),
-    check("fee_wallets_family_check", sql`${t.family} IN ('evm','tron','solana')`),
+    check("fee_wallets_family_check", sql`${t.family} IN ('evm','tron','solana','utxo')`),
     check("fee_wallets_mode_check", sql`${t.mode} IN ('hd-pool','imported')`),
     // mode='imported' REQUIRES ciphertext; mode='hd-pool' must not carry one.
     // Enforced in SQL so a malformed manual edit can't slip through and
@@ -559,7 +633,7 @@ export const invoiceReceiveAddresses = sqliteTable(
     invoiceId: text("invoice_id")
       .notNull()
       .references(() => invoices.id),
-    family: text("family", { enum: ["evm", "tron", "solana"] }).notNull(),
+    family: text("family", { enum: ["evm", "tron", "solana", "utxo"] }).notNull(),
     address: text("address").notNull(),
     poolAddressId: text("pool_address_id")
       .notNull()
@@ -570,7 +644,7 @@ export const invoiceReceiveAddresses = sqliteTable(
     primaryKey({ columns: [t.invoiceId, t.family] }),
     index("idx_invoice_rx_address").on(t.address),
     index("idx_invoice_rx_pool").on(t.poolAddressId),
-    check("invoice_rx_family_check", sql`${t.family} IN ('evm','tron','solana')`)
+    check("invoice_rx_family_check", sql`${t.family} IN ('evm','tron','solana','utxo')`)
   ]
 );
 
@@ -623,6 +697,7 @@ export const schema = {
   invoices,
   addressIndexCounters,
   transactions,
+  utxos,
   payoutReservations,
   payouts,
   alchemyWebhookRegistry,

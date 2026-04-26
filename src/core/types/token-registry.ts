@@ -97,6 +97,26 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
     isStable: false,
     displayName: "Tron (Nile)"
   },
+  // UTXO native assets. Both use 8 decimals (smallest unit = satoshi/litoshi).
+  // No ERC-20-style tokens on these chains in v1; Runes/BRC-20/Omni are too
+  // niche and operationally heavy. Native-only is the standard for payment
+  // gateways accepting BTC/LTC.
+  {
+    symbol: "BTC" as TokenSymbol,
+    chainId: 800 as ChainId,
+    contractAddress: null,
+    decimals: 8,
+    isStable: false,
+    displayName: "Bitcoin"
+  },
+  {
+    symbol: "LTC" as TokenSymbol,
+    chainId: 801 as ChainId,
+    contractAddress: null,
+    decimals: 8,
+    isStable: false,
+    displayName: "Litecoin"
+  },
 
   // ===== ERC-20 / TRC-20 / SPL stablecoins =====
   // Ethereum mainnet

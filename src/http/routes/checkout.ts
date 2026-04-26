@@ -28,7 +28,8 @@ import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
 const FAMILY_NATIVE_SYMBOLS: Readonly<Record<ChainFamily, readonly string[]>> = {
   evm: ["ETH", "BNB", "MATIC", "AVAX", "POL"],
   tron: ["TRX"],
-  solana: ["SOL"]
+  solana: ["SOL"],
+  utxo: ["BTC", "LTC"]
 };
 
 interface PayableToken {

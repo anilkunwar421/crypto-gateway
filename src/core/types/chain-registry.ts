@@ -32,6 +32,11 @@ export const CHAIN_REGISTRY: readonly ChainEntry[] = [
   // Solana (synthetic chainIds — Solana has no EVM-style id)
   { chainId: 900 as ChainId, slug: "solana", family: "solana", displayName: "Solana" },
   { chainId: 901 as ChainId, slug: "solana-devnet", family: "solana", displayName: "Solana Devnet" },
+  // UTXO chains (synthetic chainIds — Bitcoin / Litecoin have no EVM-style id).
+  // Reserved range 800-899 leaves room for testnets (802=BTC testnet3, 803=LTC
+  // testnet) and additional UTXO chains (BCH, DOGE, Zcash transparent) later.
+  { chainId: 800 as ChainId, slug: "bitcoin", family: "utxo", displayName: "Bitcoin" },
+  { chainId: 801 as ChainId, slug: "litecoin", family: "utxo", displayName: "Litecoin" },
   // Dev chain used by integration tests
   { chainId: 999 as ChainId, slug: "dev", family: "evm", displayName: "Dev Chain" }
 ];

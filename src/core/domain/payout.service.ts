@@ -2,7 +2,7 @@ import { z } from "zod";
 import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
-import { ChainIdSchema, type Address, type ChainId, type TxHash } from "../types/chain.js";
+import { ChainIdSchema, type Address, type ChainFamily, type ChainId, type TxHash } from "../types/chain.js";
 import { MerchantIdSchema } from "../types/merchant.js";
 import { AmountRawSchema, type AmountRaw } from "../types/money.js";
 import type { Payout, PayoutId } from "../types/payout.js";
@@ -967,11 +967,12 @@ function serializeCandidate(c: {
   };
 }
 
-function nativeDecimalsForFamily(family: "evm" | "tron" | "solana"): number {
+function nativeDecimalsForFamily(family: ChainFamily): number {
   switch (family) {
     case "evm": return 18;
     case "tron": return 6;
     case "solana": return 9;
+    case "utxo": return 8; // BTC + LTC both use 8 decimals (satoshis)
   }
 }
 

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const ChainFamilySchema = z.enum(["evm", "tron", "solana"]);
+export const ChainFamilySchema = z.enum(["evm", "tron", "solana", "utxo"]);
 export type ChainFamily = z.infer<typeof ChainFamilySchema>;
 
 export const ChainIdSchema = z.number().int().positive();

@@ -32,7 +32,12 @@ const SWEEP_MASTER_INDEX_BASE = 0x7F000000;
 const SWEEP_MASTER_INDEX_BY_FAMILY: Readonly<Record<ChainFamily, number>> = {
   evm: SWEEP_MASTER_INDEX_BASE + 0,
   tron: SWEEP_MASTER_INDEX_BASE + 1,
-  solana: SWEEP_MASTER_INDEX_BASE + 2
+  solana: SWEEP_MASTER_INDEX_BASE + 2,
+  // UTXO family doesn't use a sweep-master concept (each invoice address is
+  // its own spendable origin via the utxos ledger; payouts coin-select
+  // across all owned UTXOs). Index reserved here to satisfy the exhaustive
+  // family map; never actually used by the UTXO payout path.
+  utxo: SWEEP_MASTER_INDEX_BASE + 3
 };
 
 export class UnsupportedSignerOperationError extends Error {

@@ -14,8 +14,17 @@ import { drizzleRowToPayout } from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
 import { DomainError } from "../errors.js";
 import { assertWebhookUrlSafe } from "./url-safety.js";
-import { addressPool, merchants, payoutReservations, payouts } from "../../db/schema.js";
+import { addressPool, merchants, payoutReservations, payouts, utxos } from "../../db/schema.js";
 import { computeSpendable } from "./balance-snapshot.service.js";
+import { loadSpendableUtxos, selectCoins } from "./utxo-coin-select.js";
+import { allocateUtxoAddress } from "./utxo-address-allocator.js";
+import {
+  buildUtxoUnsignedTx,
+  type UtxoUnsignedRaw
+} from "../../adapters/chains/utxo/utxo-chain.adapter.js";
+import {
+  decodeP2wpkhAddress
+} from "../../adapters/chains/utxo/bech32-address.js";
 
 // PayoutService lifecycle:
 //
@@ -369,6 +378,68 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
 
   const now = deps.clock.now().getTime();
   const payoutId = globalThis.crypto.randomUUID();
+
+  // ----- UTXO family: short-circuit the account-model planner -----
+  //
+  // UTXO chains don't pick a single source — coin selection happens at
+  // broadcast time across every owned UTXO. There are no per-source
+  // reservations (the `utxos.spent_in_payout_id` column does that job
+  // atomically with the broadcast attempt). All `planPayout` does for UTXO is:
+  //   1. Verify that confirmed-and-unspent UTXOs total >= amount + fee.
+  //   2. Insert a payouts row in `reserved` state. The executor's
+  //      `broadcastUtxoMain` picks it up, runs coinselect, signs, and
+  //      broadcasts.
+  if (chainAdapter.family === "utxo") {
+    const spendable = await loadSpendableUtxos(deps, parsed.chainId as ChainId);
+    const totalSpendable = spendable.reduce((sum, u) => sum + BigInt(u.value), 0n);
+    const required = BigInt(amountRaw) + gasNeeded;
+    if (totalSpendable < required) {
+      throw new PayoutError(
+        "INSUFFICIENT_BALANCE_ANY_SOURCE",
+        `Confirmed UTXO balance ${totalSpendable.toString()} sats is below ` +
+          `requested ${amountRaw} + estimated fee ${gasNeeded.toString()} sats. ` +
+          `Wait for pending payments to confirm or top up the gateway's UTXO addresses.`
+      );
+    }
+    await deps.db.insert(payouts).values({
+      id: payoutId,
+      merchantId: parsed.merchantId,
+      kind: "standard",
+      parentPayoutId: null,
+      // `reserved` (not `planned`) so executor sweeps pick it up immediately —
+      // matches the post-selectSource invariant the cron uses for non-UTXO.
+      status: "reserved",
+      chainId: parsed.chainId,
+      token: parsed.token,
+      amountRaw,
+      quotedAmountUsd,
+      quotedRate,
+      feeTier: parsed.feeTier ?? null,
+      feeQuotedNative,
+      batchId: parsed.batchId ?? null,
+      destinationAddress: destination,
+      // sourceAddress stays NULL on UTXO — there's no single source. The
+      // executor's broadcast path knows this and runs coinselect instead of
+      // deriving a per-source key.
+      sourceAddress: null,
+      txHash: null,
+      feeEstimateNative: null,
+      topUpTxHash: null,
+      topUpSponsorAddress: null,
+      topUpAmountRaw: null,
+      lastError: null,
+      createdAt: now,
+      submittedAt: null,
+      confirmedAt: null,
+      updatedAt: now,
+      webhookUrl: parsed.webhookUrl ?? null,
+      webhookSecretCiphertext
+    });
+    const row = await fetchPayout(deps, payoutId);
+    if (!row) throw new Error(`planPayout: inserted row ${payoutId} disappeared`);
+    await deps.events.publish({ type: "payout.planned", payoutId: row.id, payout: row, at: new Date(now) });
+    return row;
+  }
 
   // Check fee-wallet availability BEFORE the IMMEDIATE transaction opens,
   // so the picker can factor it in without doing a DB read inside the
@@ -770,6 +841,42 @@ export async function estimatePayoutFees(
   const gasNeeded =
     (BigInt(tiers[targetTier].nativeAmountRaw) * safety.num) / safety.den;
 
+  // ----- UTXO family: aggregate-balance view (no per-source picker) -----
+  //
+  // UTXO chains coin-select across every owned UTXO at broadcast time;
+  // there's no single "source" to surface. The merchant gets a synthetic
+  // candidate representing the total spendable UTXO balance + the same
+  // tiers/warnings shape as account-model chains.
+  if (chainAdapter.family === "utxo") {
+    const spendable = await loadSpendableUtxos(deps, parsed.chainId as ChainId);
+    const totalSpendable = spendable.reduce((s, u) => s + BigInt(u.value), 0n);
+    const requiredAmount = BigInt(amountRaw);
+    const requiredNative = requiredAmount + gasNeeded;
+    if (totalSpendable < requiredNative) {
+      warnings.push("insufficient_utxo_balance");
+    }
+    return {
+      amountRaw,
+      quotedAmountUsd,
+      quotedRate,
+      tiers,
+      source:
+        spendable.length === 0
+          ? null
+          : {
+              // Synthetic aggregate "source" — no individual address to
+              // attribute. The frontend can render "X UTXOs across Y
+              // addresses" using `derivationIndex: -1` as a sentinel.
+              address: `<utxo-aggregate>`,
+              derivationIndex: -1,
+              tokenBalance: totalSpendable.toString(),
+              nativeBalance: totalSpendable.toString()
+            },
+      alternatives: [],
+      warnings
+    };
+  }
+
   // Discover candidate HD addresses on this chain's family.
   const family = chainAdapter.family;
   const poolRows = await deps.db
@@ -1138,6 +1245,12 @@ async function executeOnePayout(
 
   if (row.status === "topping-up") {
     return executeTopUp(deps, row);
+  }
+
+  // UTXO family: no source address, no reservations, no top-up. Coinselect
+  // + sign + broadcast happens directly against the local utxos ledger.
+  if (chainAdapter.family === "utxo") {
+    return broadcastUtxoMain(deps, row, chainAdapter);
   }
 
   // status === "reserved" (executor only fetches reserved + topping-up).
@@ -1577,6 +1690,204 @@ async function broadcastMain(
     const message = err instanceof Error ? err.message : String(err);
     return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
   }
+}
+
+// UTXO equivalent of broadcastMain. Account-model chains have a single
+// source address that signs everything; UTXO chains coin-select across all
+// owned UTXOs, derive a per-input key from each UTXO's stored
+// `addressIndex`, and (when there's leftover) emit a fresh-derived change
+// output. The whole thing — broadcast + mark-spent — happens inside a
+// single DB transaction so a process crash mid-flight either rolls back
+// (clean retry on next tick) or commits atomically (UTXOs marked spent +
+// payout in `submitted`).
+async function broadcastUtxoMain(
+  deps: AppDeps,
+  row: typeof payouts.$inferSelect,
+  chainAdapter: ChainAdapter
+): Promise<"submitted" | "failed" | "deferred"> {
+  // Broadcast-slot CAS — same idempotency guard as account-model. Stops
+  // double-send if a previous tick crashed after broadcast but before the
+  // status update.
+  const [broadcastClaim] = await deps.db
+    .update(payouts)
+    .set({ broadcastAttemptedAt: deps.clock.now().getTime() })
+    .where(
+      and(
+        eq(payouts.id, row.id),
+        isNull(payouts.broadcastAttemptedAt),
+        eq(payouts.status, "reserved")
+      )
+    )
+    .returning({ id: payouts.id });
+  if (!broadcastClaim) {
+    return "deferred";
+  }
+
+  try {
+    // Determine fee rate (sat/vB) from the merchant's chosen tier. The
+    // adapter's quoteFeeTiers returns fee = TYPICAL_VBYTES × rate; we
+    // recover the rate so coinselect can size correctly. TYPICAL_VBYTES
+    // (141) matches the constant in the adapter; the inversion here gives
+    // us a pessimistic-rounded sat/vB, which coinselect then applies to
+    // the actual tx vsize (≥ TYPICAL on multi-input txs, so fees come
+    // out slightly under quote — fine; we factored gasSafetyFactor into
+    // the planPayout headroom check).
+    const TYPICAL_VBYTES = 141;
+    const tier: "low" | "medium" | "high" = (row.feeTier as "low" | "medium" | "high" | null) ?? "medium";
+    const tierQuote = await chainAdapter.quoteFeeTiers({
+      chainId: row.chainId as ChainId,
+      fromAddress: row.destinationAddress as Address,
+      toAddress: row.destinationAddress as Address,
+      token: row.token as TokenSymbol,
+      amountRaw: row.amountRaw as AmountRaw
+    });
+    const feeRate = Math.max(1, Math.ceil(Number(tierQuote[tier].nativeAmountRaw) / TYPICAL_VBYTES));
+
+    // Load every spendable UTXO, run coinselect.
+    const spendable = await loadSpendableUtxos(deps, row.chainId as ChainId);
+    const selection = selectCoins(
+      spendable,
+      [{ address: row.destinationAddress, value: Number(row.amountRaw) }],
+      feeRate
+    );
+    if (selection === null) {
+      // Funds were verified at plan time, but a concurrent payout could
+      // have consumed them between then and now. Surface as a clean
+      // failure; merchant can retry once balance recovers.
+      return failPayout(
+        deps, row, "SOURCE_BROADCAST_FAILED",
+        `coinselect could not assemble inputs at fee rate ${feeRate} sat/vB — UTXOs may have been spent by a concurrent payout`
+      );
+    }
+
+    // Build outputs. The first entry is the merchant's destination; any
+    // entry without `address` is the change output, which we synthesize a
+    // fresh receive address for (one-shot, never reused — same privacy
+    // discipline as invoice receive addresses).
+    const seed = deps.secrets.getRequired("MASTER_SEED");
+    const outputs: Array<{ scriptPubkey: string; value: bigint }> = [];
+    let changeAddressIndex: number | null = null;
+    let changeAddress: string | null = null;
+    for (const o of selection.outputs) {
+      if (o.address === undefined) {
+        // Change output: allocate a fresh address from the same counter.
+        const allocated = await allocateUtxoAddress(deps, chainAdapter, row.chainId as ChainId, seed);
+        changeAddress = allocated.address;
+        changeAddressIndex = allocated.addressIndex;
+        outputs.push({
+          scriptPubkey: p2wpkhScriptPubkey(allocated.address),
+          value: BigInt(o.value)
+        });
+      } else {
+        outputs.push({
+          scriptPubkey: p2wpkhScriptPubkey(o.address),
+          value: BigInt(o.value)
+        });
+      }
+    }
+
+    // Build the unsigned tx + derive private keys for each chosen input.
+    const unsigned = buildUtxoUnsignedTx(
+      row.chainId as ChainId,
+      selection.chosenInputs.map((u) => ({
+        txid: u.txId,
+        vout: u.vout,
+        value: BigInt(u.value),
+        scriptPubkey: u.scriptPubkey,
+        address: u.address
+      })),
+      outputs
+    );
+    const inputPrivateKeys: Array<{ address: Address; privateKey: string }> = [];
+    for (const u of selection.chosenInputs) {
+      const pk = await deps.signerStore.get({
+        kind: "pool-address",
+        family: "utxo",
+        derivationIndex: u.addressIndex
+      });
+      inputPrivateKeys.push({ address: u.address as Address, privateKey: pk });
+    }
+
+    const txHash = await chainAdapter.signAndBroadcast(unsigned, "", { inputPrivateKeys });
+
+    // Atomically mark UTXOs spent + flip the payout to `submitted`. If the
+    // broadcast succeeded but this DB transaction fails, the next executor
+    // tick re-enters `broadcastUtxoMain`, the broadcastAttemptedAt CAS
+    // returns deferred (already set), and a retry from a different tick
+    // would see `status='reserved'` still — but this should be rare; the
+    // DB tx is local writes only, no external I/O.
+    const now2 = deps.clock.now().getTime();
+    const utxoIds = selection.chosenInputs.map((u) => u.utxoId);
+    await deps.db.transaction(async (tx) => {
+      await tx
+        .update(utxos)
+        .set({ spentInPayoutId: row.id, spentAt: now2 })
+        .where(inArray(utxos.id, utxoIds));
+      await tx
+        .update(payouts)
+        .set({
+          status: "submitted",
+          txHash,
+          submittedAt: now2,
+          updatedAt: now2,
+          // Stash the actual fee paid for audit; coinselect's `fee` is the
+          // exact sats consumed.
+          feeEstimateNative: selection.fee.toString()
+        })
+        .where(eq(payouts.id, row.id));
+    });
+
+    deps.logger.info("payout.utxo.broadcast", {
+      payoutId: row.id,
+      chainId: row.chainId,
+      txHash,
+      inputCount: selection.chosenInputs.length,
+      outputCount: selection.outputs.length,
+      feeSats: selection.fee,
+      changeAddress: changeAddress ?? null,
+      changeAddressIndex
+    });
+
+    const updated = await fetchPayout(deps, row.id);
+    if (updated) {
+      await deps.events.publish({
+        type: "payout.submitted",
+        payoutId: updated.id,
+        payout: updated,
+        at: new Date(now2)
+      });
+    }
+    return "submitted";
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+  }
+}
+
+// P2WPKH scriptPubkey from a bech32 address: 0x00 (OP_0) || 0x14 (push 20)
+// || 20-byte hash160. Used by broadcastUtxoMain to convert merchant
+// destination + change addresses into the script form coinselect's outputs
+// and the signing pipeline expect. Throws on non-P2WPKH addresses — UTXO
+// payouts only accept native-segwit destinations in v1 (legacy P2PKH and
+// P2SH-segwit are out of scope; sending TO them would just need a relaxed
+// scriptPubkey computation but we deliberately don't support that yet
+// because it broadens the surface area we'd have to test).
+function p2wpkhScriptPubkey(address: string): string {
+  const decoded = decodeP2wpkhAddress(address.toLowerCase());
+  if (decoded === null) {
+    throw new Error(
+      `payout: destination ${address} is not a P2WPKH bech32 address (legacy / P2SH-segwit / taproot not supported in v1)`
+    );
+  }
+  return `0014${bytesToHexLocal(decoded.program)}`;
+}
+
+function bytesToHexLocal(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    s += bytes[i]!.toString(16).padStart(2, "0");
+  }
+  return s;
 }
 
 // Move a payout to `failed`, release ALL of its reservation rows (the source

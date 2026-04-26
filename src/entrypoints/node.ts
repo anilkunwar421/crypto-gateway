@@ -18,6 +18,11 @@ import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
+import {
+  bitcoinChainAdapter,
+  litecoinChainAdapter
+} from "../adapters/chains/utxo/utxo-chain.adapter.js";
+import { BITCOIN_CONFIG, LITECOIN_CONFIG } from "../adapters/chains/utxo/utxo-config.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
@@ -169,6 +174,20 @@ async function main(): Promise<void> {
     // Pool's Alchemy fan-out covers Solana too (webhook-based detection).
     activeAlchemyChainIds.push(solanaWiring.chainId);
   }
+
+  // UTXO wiring (Bitcoin + Litecoin). No API creds needed — Esplora's public
+  // endpoints (mempool.space + Blockstream) handle detection and broadcast
+  // without keys. Wired unconditionally; operators who don't accept BTC/LTC
+  // simply never create invoices on chains 800/801, and the adapters sit
+  // idle. Detection runs through the same `rpcPollDetection` path EVM uses
+  // when it's Alchemy-RPC-only (no webhook source).
+  chains.push(bitcoinChainAdapter());
+  detectionStrategies[BITCOIN_CONFIG.chainId] = rpcPollDetection();
+  chains.push(litecoinChainAdapter());
+  detectionStrategies[LITECOIN_CONFIG.chainId] = rpcPollDetection();
+  logger.info("UTXO chains wired", {
+    chainIds: [BITCOIN_CONFIG.chainId, LITECOIN_CONFIG.chainId]
+  });
 
   // Secrets-at-rest cipher. In prod/staging `SECRETS_ENCRYPTION_KEY` is
   // required (config.schema.ts enforces); in dev/test we fall back to the

@@ -94,6 +94,25 @@ export interface EsploraClient {
 
   // Current tip height. Used to compute confirmations = tip - block_height + 1.
   getTipHeight(): Promise<number>;
+
+  // Broadcast a signed tx (hex). Returns the txid Esplora confirmed accepting
+  // (which must equal the locally-computed txid; we cross-check upstream).
+  // Throws EsploraBackendError on rejection so the caller can surface the
+  // specific node error message — typical failures are "min relay fee not
+  // met", "bad-txns-inputs-missingorspent" (UTXO already spent), or
+  // "non-mandatory-script-verify-flag" (signature rejected).
+  broadcastTx(rawHex: string): Promise<string>;
+
+  // Recommended fee rates per confirmation target. Esplora returns an object
+  // keyed by confirmation-target string ("1", "2", "3", ..., "144", "504",
+  // "1008"); values are sat/vB. We project to low/medium/high tiers in the
+  // chain adapter's quoteFeeTiers.
+  getFeeEstimates(): Promise<Readonly<Record<string, number>>>;
+
+  // Address summary: `chain_stats.funded_txo_sum - chain_stats.spent_txo_sum`
+  // is the on-chain confirmed balance in satoshis. Mempool stats are kept
+  // separately. Returns 0 for never-seen addresses.
+  getAddressBalanceSats(address: string): Promise<bigint>;
 }
 
 export interface EsploraClientConfig {
@@ -193,6 +212,53 @@ export function esploraClient(config: EsploraClientConfig): EsploraClient {
           throw new EsploraBackendError(b.baseUrl, 200, `non-numeric tip height: ${text}`);
         }
         return n;
+      });
+    },
+
+    async broadcastTx(rawHex: string): Promise<string> {
+      return withFailover(async (backend) => {
+        const url = `${backend.baseUrl.replace(/\/+$/, "")}/tx`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const res = await fetchImpl(url, {
+            method: "POST",
+            headers: { "content-type": "text/plain" },
+            body: rawHex,
+            signal: controller.signal
+          });
+          if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            throw new EsploraBackendError(backend.baseUrl, res.status, body);
+          }
+          // On success, Esplora returns the bare txid as a string.
+          return (await res.text()).trim();
+        } catch (err) {
+          if (err instanceof EsploraBackendError) throw err;
+          throw new EsploraBackendError(backend.baseUrl, null, err);
+        } finally {
+          clearTimeout(timer);
+        }
+      });
+    },
+
+    async getFeeEstimates(): Promise<Readonly<Record<string, number>>> {
+      return withFailover((b) => getJson<Record<string, number>>(b, "/fee-estimates"));
+    },
+
+    async getAddressBalanceSats(address: string): Promise<bigint> {
+      return withFailover(async (b) => {
+        try {
+          const info = await getJson<{
+            chain_stats: { funded_txo_sum: number; spent_txo_sum: number };
+            mempool_stats: { funded_txo_sum: number; spent_txo_sum: number };
+          }>(b, `/address/${address}`);
+          // Confirmed balance only — mempool funds aren't spendable yet.
+          return BigInt(info.chain_stats.funded_txo_sum - info.chain_stats.spent_txo_sum);
+        } catch (err) {
+          if (err instanceof EsploraNotFoundError) return 0n;
+          throw err;
+        }
       });
     }
   };

@@ -28,6 +28,15 @@ function fakeClient(impl: Partial<EsploraClient>): EsploraClient {
     async getTipHeight() {
       return 0;
     },
+    async broadcastTx() {
+      throw new Error("broadcastTx not used by these tests");
+    },
+    async getFeeEstimates() {
+      return {};
+    },
+    async getAddressBalanceSats() {
+      return 0n;
+    },
     ...impl
   };
 }

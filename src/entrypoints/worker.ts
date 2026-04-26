@@ -2,6 +2,11 @@ import type { ExecutionContext, KVNamespace, RateLimit, ScheduledController } fr
 import { buildApp, registerEventSubscribers } from "../app.js";
 import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
+import {
+  bitcoinChainAdapter,
+  litecoinChainAdapter
+} from "../adapters/chains/utxo/utxo-chain.adapter.js";
+import { BITCOIN_CONFIG, LITECOIN_CONFIG } from "../adapters/chains/utxo/utxo-config.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
@@ -175,6 +180,18 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     chains.push(solanaWiring.chainAdapter);
     activeAlchemyChainIds.push(solanaWiring.chainId);
   }
+
+  // UTXO wiring (Bitcoin + Litecoin). No API creds — Esplora's public
+  // endpoints handle detection + broadcast. Wired unconditionally; idle
+  // when no merchant invoices on these chains. See node.ts for matching
+  // rationale.
+  chains.push(bitcoinChainAdapter());
+  detectionStrategies[BITCOIN_CONFIG.chainId] = rpcPollDetection();
+  chains.push(litecoinChainAdapter());
+  detectionStrategies[LITECOIN_CONFIG.chainId] = rpcPollDetection();
+  logger.info("UTXO chains wired", {
+    chainIds: [BITCOIN_CONFIG.chainId, LITECOIN_CONFIG.chainId]
+  });
 
   // Secrets-at-rest cipher. SECRETS_ENCRYPTION_KEY is REQUIRED in
   // production / staging — Workers don't run loadConfig the way node.ts

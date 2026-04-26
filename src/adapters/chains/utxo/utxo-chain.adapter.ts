@@ -23,6 +23,12 @@ import {
   type EsploraTx
 } from "./esplora-rpc.js";
 import {
+  signSegwitTx,
+  type InputSigningKey,
+  type UnsignedSegwitTx
+} from "./utxo-sign.js";
+import type { UtxoInput, UtxoOutput } from "./utxo-tx-encode.js";
+import {
   BITCOIN_CONFIG,
   LITECOIN_CONFIG,
   utxoConfigForChainId,
@@ -239,32 +245,223 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
       }
     },
 
-    // ---- Payouts (Phase 3) ----
-
+    // ---- Payouts ----
+    //
+    // UTXO chains don't fit the account-model `buildTransfer(from, to,
+    // amount)` signature: the FROM is implicit (whatever inputs coinselect
+    // picks across all owned UTXOs), and the BUILD result must enumerate
+    // those picked inputs. The domain layer (payout.service) handles the
+    // family branch by:
+    //   1. loadSpendableUtxos(deps, chainId) — local DB query
+    //   2. selectCoins(utxos, targets, feeRate) — pure coinselect
+    //   3. buildUtxoUnsignedTx(picked) — exported below; produces UnsignedTx
+    //   4. adapter.signAndBroadcast(unsigned, "", { inputPrivateKeys }) —
+    //      this method, signs each input with the matching key.
+    //
+    // Calling `buildTransfer` directly on a UTXO adapter is a domain bug
+    // (the account-model branch of payout.service shouldn't reach here);
+    // throw a helpful error so the misroute surfaces loudly.
     async buildTransfer(_args: BuildTransferArgs): Promise<UnsignedTx> {
-      throw new UtxoNotImplementedError("buildTransfer");
+      throw new Error(
+        `utxoChainAdapter: buildTransfer is account-model only. UTXO payouts must go through ` +
+          `loadSpendableUtxos → selectCoins → buildUtxoUnsignedTx → signAndBroadcast.`
+      );
     },
 
-    async signAndBroadcast(): Promise<TxHash> {
-      throw new UtxoNotImplementedError("signAndBroadcast");
+    async signAndBroadcast(unsignedTx, _privateKey, options): Promise<TxHash> {
+      const raw = unsignedTx.raw as UtxoUnsignedRaw | undefined;
+      if (!raw || raw.family !== "utxo") {
+        throw new Error(
+          `utxoChainAdapter.signAndBroadcast: unsignedTx.raw is not a UTXO build (got ${
+            raw && typeof raw === "object" && "family" in raw ? String(raw.family) : "missing"
+          })`
+        );
+      }
+      const inputPrivateKeys = options?.inputPrivateKeys;
+      if (!inputPrivateKeys || inputPrivateKeys.length !== raw.inputs.length) {
+        throw new Error(
+          `utxoChainAdapter.signAndBroadcast: options.inputPrivateKeys must carry one key per input ` +
+            `(expected ${raw.inputs.length}, got ${inputPrivateKeys?.length ?? 0})`
+        );
+      }
+      // Order keys to match `raw.inputs` by address. The caller is expected
+      // to pass them in the same order; we accept either ordering as long
+      // as the addresses cover every input. Mismatches surface as a sign-
+      // time error from signSegwitTx (hash160 cross-check).
+      const keysByAddress = new Map<string, string>();
+      for (const k of inputPrivateKeys) keysByAddress.set(k.address.toLowerCase(), k.privateKey);
+      const orderedKeys: InputSigningKey[] = raw.inputs.map((input, i) => {
+        const owner = raw.inputAddresses[i];
+        if (!owner) {
+          throw new Error(`signAndBroadcast: missing inputAddresses[${i}] for input ${input.prevTxid}:${input.prevVout}`);
+        }
+        const pk = keysByAddress.get(owner.toLowerCase());
+        if (!pk) {
+          throw new Error(`signAndBroadcast: no inputPrivateKey supplied for input owner ${owner}`);
+        }
+        return { address: owner, privateKey: pk };
+      });
+
+      const tx: UnsignedSegwitTx = {
+        version: raw.version,
+        locktime: raw.locktime,
+        inputs: raw.inputs,
+        outputs: raw.outputs
+      };
+      const signed = signSegwitTx(tx, orderedKeys);
+      // Esplora returns the txid Bitcoin Core acknowledged. Cross-check
+      // against the locally-computed value — a mismatch would mean the
+      // server normalized our hex differently (shouldn't happen) and is
+      // worth surfacing as an error rather than silently accepting.
+      const remoteTxid = await esplora.broadcastTx(signed.hex);
+      if (remoteTxid.toLowerCase() !== signed.txid.toLowerCase()) {
+        throw new Error(
+          `signAndBroadcast: remote txid ${remoteTxid} != local txid ${signed.txid} ` +
+            `(this should never happen; possible server-side reserialization)`
+        );
+      }
+      return signed.txid as TxHash;
     },
 
     async estimateGasForTransfer(_args: EstimateArgs): Promise<AmountRaw> {
-      throw new UtxoNotImplementedError("estimateGasForTransfer");
+      // Typical 1-input 2-output P2WPKH tx is ~141 vbytes. Fee = vsize ×
+      // medium feeRate (sat/vB). Used by the source-picker for sanity
+      // checks; the actual fee at broadcast comes from coinselect's
+      // feeRate × actual vsize.
+      const TYPICAL_VBYTES = 141;
+      const fees = await esplora.getFeeEstimates().catch(() => ({}));
+      const mediumFeeRate = pickFeeTier(fees, "medium");
+      return (BigInt(Math.ceil(TYPICAL_VBYTES * mediumFeeRate))).toString() as AmountRaw;
     },
 
     async quoteFeeTiers(_args: EstimateArgs): Promise<FeeTierQuote> {
-      throw new UtxoNotImplementedError("quoteFeeTiers");
+      const TYPICAL_VBYTES = 141;
+      const fees = await esplora.getFeeEstimates().catch(() => ({}));
+      const lowRate = pickFeeTier(fees, "low");
+      const medRate = pickFeeTier(fees, "medium");
+      const highRate = pickFeeTier(fees, "high");
+      const feeAt = (rate: number): AmountRaw =>
+        BigInt(Math.ceil(TYPICAL_VBYTES * rate)).toString() as AmountRaw;
+      return {
+        low: { tier: "low", nativeAmountRaw: feeAt(lowRate) },
+        medium: { tier: "medium", nativeAmountRaw: feeAt(medRate) },
+        high: { tier: "high", nativeAmountRaw: feeAt(highRate) },
+        // UTXO has real tier differentiation via mempool fee-market depth,
+        // unlike Tron's flat-energy model.
+        tieringSupported: true,
+        nativeSymbol: chain.nativeSymbol as TokenSymbol
+      };
     },
 
-    async getBalance(_args): Promise<AmountRaw> {
-      throw new UtxoNotImplementedError("getBalance");
+    async getBalance({ token, address }): Promise<AmountRaw> {
+      // UTXO chains carry only the native token. Anything else returns 0n
+      // since it can't have a balance on this chain by construction.
+      if (token !== chain.nativeSymbol) {
+        return "0" as AmountRaw;
+      }
+      const sats = await esplora.getAddressBalanceSats(address.toLowerCase()).catch(() => 0n);
+      return sats.toString() as AmountRaw;
     },
 
-    async getAccountBalances(_args): Promise<readonly { token: TokenSymbol; amountRaw: AmountRaw }[]> {
-      throw new UtxoNotImplementedError("getAccountBalances");
+    async getAccountBalances({ address }): Promise<readonly { token: TokenSymbol; amountRaw: AmountRaw }[]> {
+      const sats = await esplora.getAddressBalanceSats(address.toLowerCase()).catch(() => 0n);
+      if (sats === 0n) return [];
+      return [{ token: chain.nativeSymbol as TokenSymbol, amountRaw: sats.toString() as AmountRaw }];
     }
   };
+}
+
+// ---- UTXO unsigned-tx shape carried in UnsignedTx.raw ----
+//
+// payout.service builds this after coinselect, then hands it to the adapter's
+// signAndBroadcast. The `family: "utxo"` discriminator lets the adapter
+// reject a misrouted account-model raw with a clear error.
+export interface UtxoUnsignedRaw {
+  readonly family: "utxo";
+  readonly version: number;
+  readonly locktime: number;
+  readonly inputs: readonly UtxoInput[];
+  readonly outputs: readonly UtxoOutput[];
+  // Per-input owner address (lowercase, canonical bech32). Same order as
+  // `inputs`. Used by signAndBroadcast to match each input to its private
+  // key in `options.inputPrivateKeys`. We don't carry the address inside
+  // UtxoInput itself because UtxoInput is also used for non-payout
+  // contexts (sighash testing) where the owner isn't relevant.
+  readonly inputAddresses: readonly string[];
+}
+
+// Payout.service entry point. Given the inputs coinselect chose plus the
+// final outputs (target(s) + change), assemble the UTXO raw and wrap it as
+// an UnsignedTx. version=2 + locktime=0 + sequence=0xfffffffd (non-final,
+// signals RBF-aware) — same defaults bitcoinjs-lib uses for new txs.
+export function buildUtxoUnsignedTx(
+  chainId: ChainId,
+  picked: ReadonlyArray<{
+    readonly txid: string;
+    readonly vout: number;
+    readonly value: bigint;
+    readonly scriptPubkey: string;
+    readonly address: string;
+  }>,
+  outputs: ReadonlyArray<{ readonly scriptPubkey: string; readonly value: bigint }>
+): UnsignedTx {
+  if (picked.length === 0) {
+    throw new Error("buildUtxoUnsignedTx: at least one input required");
+  }
+  if (outputs.length === 0) {
+    throw new Error("buildUtxoUnsignedTx: at least one output required");
+  }
+  // sequence = 0xfffffffd → opt-in RBF (BIP125). Doesn't change current
+  // behavior (we don't replace), but leaves the door open for an RBF
+  // bump later without invalidating the in-mempool fingerprint of the
+  // signed tx (the sequence number is part of the sighash).
+  const inputs: UtxoInput[] = picked.map((p) => ({
+    prevTxid: p.txid,
+    prevVout: p.vout,
+    prevScriptPubkey: p.scriptPubkey,
+    prevValue: p.value,
+    sequence: 0xfffffffd
+  }));
+  const txOutputs: UtxoOutput[] = outputs.map((o) => ({
+    scriptPubkey: o.scriptPubkey,
+    value: o.value
+  }));
+  const raw: UtxoUnsignedRaw = {
+    family: "utxo",
+    version: 2,
+    locktime: 0,
+    inputs,
+    outputs: txOutputs,
+    inputAddresses: picked.map((p) => p.address.toLowerCase())
+  };
+  return {
+    chainId,
+    raw,
+    summary: `UTXO: ${picked.length} input(s) → ${outputs.length} output(s)`
+  };
+}
+
+// Project Esplora's per-confirmation-target fee map onto our 3-tier model.
+//   low    = ~6-block target (1-hour wait)
+//   medium = ~3-block target (30-minute wait)
+//   high   = ~1-block target (next-block)
+// Esplora's `/fee-estimates` returns sat/vB indexed by confirmation target
+// as a string ("1", "2", "3", "6", "10", ...). We pick the closest available.
+// 1 sat/vB minimum prevents the floor from going below the relay rule.
+function pickFeeTier(
+  fees: Readonly<Record<string, number>>,
+  tier: "low" | "medium" | "high"
+): number {
+  const targets = tier === "high" ? ["1", "2"] : tier === "medium" ? ["3", "4", "5"] : ["6", "10", "20", "144"];
+  for (const t of targets) {
+    const v = fees[t];
+    if (typeof v === "number" && v > 0) return v;
+  }
+  // Fallback: any positive value, or 1 sat/vB minimum.
+  for (const v of Object.values(fees)) {
+    if (typeof v === "number" && v > 0) return v;
+  }
+  return 1;
 }
 
 // Marker for the Phase 2/3 stubs so callers can detect the in-progress family

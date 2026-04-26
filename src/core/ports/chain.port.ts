@@ -107,10 +107,25 @@ export interface ChainAdapter {
   // (EVM / Tron / Dev, whose topologies don't co-sign). Passing a fee-payer
   // key on a chain whose `feeWalletCapability === "none"` is a caller bug;
   // adapters MAY throw to surface it.
+  //
+  // `options.inputPrivateKeys` is meaningful ONLY on UTXO-family chains
+  // (Bitcoin / Litecoin) where each input may be funded from a different
+  // address with a different private key. Caller derives one key per input
+  // (using the BIP44 index stored on the utxos row) and passes them in the
+  // same order as `unsignedTx.raw.inputs`. The single `privateKey` argument
+  // is unused for UTXO and the caller MAY pass any non-empty placeholder
+  // (the existing positional shape is preserved for API stability).
+  // Account-model adapters (EVM / Tron / Solana / Dev) ignore the field.
   signAndBroadcast(
     unsignedTx: UnsignedTx,
     privateKey: string,
-    options?: { readonly feePayerPrivateKey?: string }
+    options?: {
+      readonly feePayerPrivateKey?: string;
+      readonly inputPrivateKeys?: ReadonlyArray<{
+        readonly address: Address;
+        readonly privateKey: string;
+      }>;
+    }
   ): Promise<TxHash>;
 
   // ---- Fees ----

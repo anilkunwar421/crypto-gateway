@@ -1,0 +1,140 @@
+// Cloudflare Workers deployment config.
+//
+// >>> For local dev / deployment, copy this file to `wrangler.jsonc` and fill
+//     in your own Turso + KV ids (the real file is gitignored). <<<
+//
+// First-time setup:
+//   cp wrangler.jsonc.example wrangler.jsonc
+//
+//   # Create a Turso database and get its HTTP URL + auth token:
+//   #   turso db create crypto-gateway-dev
+//   #   turso db show crypto-gateway-dev --url        # -> libsql://...turso.io
+//   #   turso db tokens create crypto-gateway-dev     # -> eyJhbGciOi...
+//   # Or from the dashboard: https://app.turso.tech
+//
+//   # Apply Drizzle migrations against the remote Turso DB. This is CLI-side
+//   # because Workers has no filesystem at runtime. `drizzle-kit push` reads
+//   # drizzle.config.ts (which in turn reads TURSO_URL / TURSO_AUTH_TOKEN
+//   # from your local env) and applies drizzle/migrations/*.sql in order:
+//   TURSO_URL="libsql://..." TURSO_AUTH_TOKEN="eyJ..." npx drizzle-kit push
+//
+//   # Register the Turso URL + token as Worker secrets (not [vars] — they
+//   # grant write access, so treat them as credentials):
+//   npx wrangler secret put TURSO_URL                       # libsql://<db>-<org>.turso.io
+//   npx wrangler secret put TURSO_AUTH_TOKEN                # token from `turso db tokens create`
+//
+//   npx wrangler kv namespace create CACHE              # paste id below
+//   npx wrangler secret put MASTER_SEED                 # BIP39 mnemonic
+//   npx wrangler secret put ADMIN_KEY                   # random 32+ chars
+//   npx wrangler secret put CRON_SECRET                 # optional, only for /internal/cron/tick
+//   npx wrangler secret put ALCHEMY_API_KEY                 # optional, but recommended (per-app JSON-RPC key)
+//   npx wrangler secret put ALCHEMY_NOTIFY_TOKEN            # optional; required for /admin/bootstrap/alchemy-webhooks
+//                                                           # NOT the same as ALCHEMY_API_KEY — get it from
+//                                                           # https://dashboard.alchemy.com/apps/latest/webhooks
+//                                                           # (top of page: "Auth Token"). Using the API key
+//                                                           # here returns 401 from Alchemy's webhook admin API.
+//                                                           # (Old name ALCHEMY_AUTH_TOKEN still accepted for one release.)
+//   npx wrangler secret put GATEWAY_PUBLIC_URL              # required for webhook bootstrap — e.g. https://your-worker.workers.dev
+//
+// Optional price-oracle + alerting knobs (see README "Price oracle fallback
+// chain" and "Log shipping + alerting"):
+//   npx wrangler secret put COINGECKO_API_KEY               # optional; raises CoinGecko rate budget (keyless free tier works too)
+//   npx wrangler secret put COINCAP_API_KEY                 # optional; raises CoinCap rate budget
+//   # Set these as plain vars (not secrets) via [vars] below if you want to
+//   # disable individual providers or pick a non-default PRICE_ADAPTER:
+//   #   PRICE_ADAPTER=coingecko|alchemy|static-peg
+//   #   COINGECKO_PLAN=demo|pro
+//   #   DISABLE_COINGECKO=1 / DISABLE_COINCAP=1 / DISABLE_BINANCE=1 / DISABLE_ALCHEMY=1
+//   npx wrangler secret put ALERT_WEBHOOK_URL               # optional; error/fatal logs POSTed here (30/min rate-limit, JSON body)
+//   npx wrangler secret put ALERT_WEBHOOK_AUTH_HEADER       # optional; Authorization header value for ALERT_WEBHOOK_URL
+//
+// When a new migration is added (e.g. `drizzle/migrations/0001_xxx.sql` +
+// `meta/_journal.json` entry from `npx drizzle-kit generate`): re-run
+// `npx drizzle-kit push` against the remote TURSO_URL. Workers has no
+// filesystem at runtime, so the `/admin/migrate` endpoint returns 501 on
+// this runtime — drizzle-kit is the canonical migration applier for Workers.
+// Node / Deno entrypoints run Drizzle's migrator at boot and apply any new
+// files automatically.
+//
+// Deploy:
+//   npx wrangler deploy -e dev
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crypto-gateway",
+  "main": "src/entrypoints/worker.ts",
+  "compatibility_date": "2026-03-14",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Scheduled cron — runs every 2 minutes. The worker entrypoint's `scheduled`
+  // handler invokes pollPayments + confirmTransactions + executeReservedPayouts
+  // + confirmPayouts in sequence. Runtime stays alive via waitUntil.
+  //
+  // Why 2 minutes (not 1)? Each tick fans out one RPC call per active
+  // (invoice address × token) plus one per confirming tx — on a paid Alchemy
+  // plan that's ~110k requests/day for just a handful of invoices when the
+  // cron runs every minute. Halving the cron rate halves polling load with
+  // negligible UX impact (most chains finalize in 30-90s, well under our
+  // confirmation thresholds, so users don't notice a 60s vs 120s detection
+  // gap). For lower-latency detection, prefer push-based webhook adapters
+  // (alchemy-notify) over reducing this interval.
+  "triggers": {
+    "crons": ["*/2 * * * *"]
+  },
+
+  // No d1_databases binding — Turso replaces D1 as of 2026-Q1. The
+  // @libsql/client library ships a workerd-compatible HTTP-only build
+  // (no node:net), so the entrypoint talks to Turso over HTTPS using
+  // TURSO_URL + TURSO_AUTH_TOKEN secrets (set via `wrangler secret put`).
+
+  // KV namespace for CacheStore. See setup steps above; paste your `id` here.
+  // Add `preview_id` as well if you run `wrangler dev`.
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "REPLACE_WITH_KV_ID"
+    }
+  ],
+
+  // Cloudflare built-in rate-limit bindings. One entry per scope — each
+  // binding is ONE (limit, period) pair enforced atomically at the edge,
+  // free, with no invocation cost on our side. Scopes map to the prefix
+  // used by the middleware (`rateLimit({ scope: "..." })` in routes).
+  //
+  // namespace_id: any unique uint32 per binding within this account; the
+  // values below are arbitrary but stable — keep them in sync across envs
+  // so a rolling deploy doesn't flip buckets. `simple.limit` / `simple.period`
+  // should track the RATE_LIMIT_*_PER_MINUTE vars below (those feed the
+  // middleware headers; these enforce the actual cap).
+  //
+  // Any binding you omit falls back to the KV-backed limiter (the
+  // cacheBackedRateLimiter adapter), which has a documented over-admit
+  // risk under burst. Declare all four for strict production limits.
+  "ratelimits": [
+    { "name": "RATE_LIMIT_ADMIN",           "namespace_id": "4001", "simple": { "limit": 30,   "period": 60 } },
+    { "name": "RATE_LIMIT_CHECKOUT",        "namespace_id": "4002", "simple": { "limit": 60,   "period": 60 } },
+    { "name": "RATE_LIMIT_WEBHOOK_INGEST",  "namespace_id": "4003", "simple": { "limit": 300,  "period": 60 } },
+    { "name": "RATE_LIMIT_MERCHANT_API",    "namespace_id": "4004", "simple": { "limit": 1000, "period": 60 } }
+  ],
+
+  // Public env vars. Secrets (TURSO_URL, TURSO_AUTH_TOKEN, MASTER_SEED,
+  // ADMIN_KEY, CRON_SECRET, ALCHEMY_NOTIFY_TOKEN, SECRETS_ENCRYPTION_KEY, ...)
+  // are set via `wrangler secret put <NAME>` and do NOT go here.
+  "vars": {
+    "DB_ADAPTER": "turso",
+    "CACHE_ADAPTER": "cf-kv",
+    "JOBS_ADAPTER": "wait-until"
+  },
+
+  // Named per-environment overrides. Start with a dev env; staging / production
+  // get their own Turso + KV ids to keep data isolated.
+  "env": {
+    "dev": {
+      "name": "crypto-gateway-dev",
+      "vars": { "ENV": "dev" }
+    }
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

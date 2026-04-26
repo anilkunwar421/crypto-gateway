@@ -1,0 +1,3065 @@
+openapi: 3.1.0
+info:
+  title: crypto-gateway
+  version: 0.0.0
+  description: |
+    Runtime-agnostic crypto payment gateway with pluggable chain adapters
+    (EVM / Tron / Solana), DB adapters (D1 / libSQL / Postgres), cache
+    adapters, detection strategies, and webhook delivery.
+
+    Deploys on Cloudflare Workers, Node/Bun, Deno, and Vercel Edge from one
+    codebase.
+
+    ### Deployment knobs (not HTTP routes)
+
+    The behaviors below are server-side config read at boot and do not
+    surface as endpoints. They're documented here so operators who only
+    have the OpenAPI spec can discover them.
+
+    **Price oracle fallback chain.** Invoice quoting walks a chained list
+    of providers on every request; each link tries itself first and
+    delegates to the next on error/timeout/unmapped symbol. Only the
+    terminal `static-peg` link serves hardcoded values. Default ordering
+    when `ALCHEMY_API_KEY` is set:
+    `CoinGecko → Alchemy → CoinCap → Binance → static-peg`.
+    Knobs: `PRICE_ADAPTER=alchemy|coingecko|static-peg` (swaps the primary
+    or collapses to the static link), `COINGECKO_API_KEY` +
+    `COINGECKO_PLAN=demo|pro`, `COINCAP_API_KEY`, and per-provider
+    opt-outs `DISABLE_COINGECKO=1` / `DISABLE_COINCAP=1` /
+    `DISABLE_BINANCE=1` / `DISABLE_ALCHEMY=1`. `PRICE_ADAPTER=alchemy`
+    without a key logs a warning and falls back to the default ordering.
+
+    **Log shipping + alerting.** Setting `ALERT_WEBHOOK_URL` attaches an
+    HTTP sink to the structured logger; every `error` or `fatal` log is
+    POSTed as `{ ts, level, msg, ...fields }` JSON. Sliding-window rate
+    limited to 30/min with a `droppedSinceLast` counter piggybacked on
+    the next successful delivery. Use `ALERT_WEBHOOK_AUTH_HEADER` for the
+    `Authorization` header value (e.g. `Bearer xyz`). Fire-and-forget —
+    a broken sink never breaks the caller's log path.
+
+    See the repository README for the full env-var table.
+
+servers:
+  - url: http://localhost:8787
+    description: Local Node dev
+  - url: https://crypto-gateway-dev.workers.dev
+    description: Dev Workers (placeholder — replace with your subdomain)
+
+tags:
+  - name: invoices
+    description: Merchant-facing invoice lifecycle
+  - name: payouts
+    description: Merchant-facing payout lifecycle
+  - name: checkout
+    description: Public invoice view (for hosted checkout UIs)
+  - name: webhooks
+    description: Inbound webhook ingest from on-chain providers
+  - name: admin
+    description: Operator-only setup
+  - name: fee-wallets
+    description: |
+      Per-family gas provider configuration. Registering a fee wallet on a
+      family whose adapter supports the topology (Solana co-sign, Tron
+      delegate) lets pool addresses stop holding native gas — the fee
+      wallet covers sig fees, ATA rent (Solana), and/or delegated energy
+      (Tron) for every payout. Opt-in per family; EVM is not supported
+      today.
+  - name: tron
+    description: Tron-specific Stake 2.0 resource operations (freeze / delegate / status).
+  - name: internal
+    description: Scheduler-driven maintenance
+  - name: health
+
+security:
+  - MerchantApiKey: []
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Service up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, phase]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  phase: { type: integer }
+
+  /api/v1/invoices:
+    get:
+      tags: [invoices]
+      summary: List invoices for the authenticated merchant
+      description: |
+        Returns invoices created by the authenticated merchant, newest first
+        (`createdAt DESC`). All filters are optional and AND-combined. The
+        `merchantId` is always taken from the API key — there is no way to
+        list another merchant's invoices.
+
+        Pagination uses `limit` + `offset`. The response includes `hasMore`
+        (computed without a `COUNT(*)`), so callers can page until `hasMore`
+        is false.
+      parameters:
+        - name: status
+          in: query
+          description: |
+            Comma-separated list of statuses. Any of:
+            `created,partial,detected,confirmed,overpaid,expired,canceled`.
+            Unknown values yield 400.
+          schema: { type: string }
+        - name: chainId
+          in: query
+          schema: { type: integer }
+        - name: token
+          in: query
+          schema: { type: string }
+        - name: externalId
+          in: query
+          description: Merchant-supplied dedup key (exact match).
+          schema: { type: string }
+        - name: toAddress
+          in: query
+          description: |
+            Invoice receive address — what the payer saw on the checkout page.
+            Exact match; pass the canonicalized form.
+          schema: { type: string }
+        - name: fromAddress
+          in: query
+          description: |
+            Payer address. Matches invoices that have any detected or confirmed
+            transaction from this address. Reverted / orphaned transactions
+            are excluded so a single failed payment doesn't surface a stale
+            invoice.
+          schema: { type: string }
+        - name: createdFrom
+          in: query
+          description: Inclusive lower bound on `createdAt`. ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: createdTo
+          in: query
+          description: Inclusive upper bound on `createdAt`. ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Paginated list of invoices
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invoices, limit, offset, hasMore]
+                properties:
+                  invoices:
+                    type: array
+                    items: { $ref: "#/components/schemas/Invoice" }
+                  limit: { type: integer }
+                  offset: { type: integer }
+                  hasMore: { type: boolean }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [invoices]
+      summary: Create an invoice
+      description: |
+        Creates an invoice and allocates a receive address derived from the
+        gateway's HD seed. The merchant is resolved from the API key — the
+        caller MUST NOT include `merchantId` in the body; if they do, it's
+        ignored.
+
+        **Idempotency.** Pass `externalId` to make the call idempotent: a
+        retry with the same `(merchantId, externalId)` returns the existing
+        invoice instead of creating a duplicate. Safe to send the same POST
+        multiple times after a timeout or 5xx.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateInvoiceInput" }
+      responses:
+        "201":
+          description: Invoice created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invoice]
+                properties:
+                  invoice: { $ref: "#/components/schemas/Invoice" }
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/invoices/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [invoices]
+      summary: Fetch an invoice with USD breakdown and per-transaction detail
+      description: |
+        Returns the invoice along with two extra blocks not surfaced on POST
+        responses:
+          - `amounts` — USD-axis recomputation (required / confirmed /
+            confirming / remaining / overpaid). All-null on legacy
+            single-token invoices.
+          - `transactions` — every on-chain row tied to this invoice (all
+            statuses, including `reverted` and `orphaned` for debugging).
+      responses:
+        "200":
+          description: Invoice found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InvoiceDetails" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/invoices/{id}/expire:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [invoices]
+      summary: Force-expire an invoice before its expiry window elapses
+      responses:
+        "200":
+          description: Invoice expired
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invoice: { $ref: "#/components/schemas/Invoice" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Invoice is in a terminal state and cannot be expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/payouts:
+    get:
+      tags: [payouts]
+      summary: List payouts for the authenticated merchant
+      description: |
+        Returns payouts planned by the authenticated merchant, newest first
+        (`createdAt DESC`). All filters optional, AND-combined. `merchantId`
+        is always taken from the API key.
+
+        Pagination via `limit` + `offset`; response includes `hasMore`
+        (computed without `COUNT(*)`).
+      parameters:
+        - name: status
+          in: query
+          description: |
+            Comma-separated list of statuses. Any of:
+            `planned,reserved,topping-up,submitted,confirmed,failed,canceled`.
+            `topping-up` indicates the source address lacked native gas and
+            the executor is waiting for a sponsor → source top-up tx to
+            confirm before broadcasting the main payout.
+          schema: { type: string }
+        - name: chainId
+          in: query
+          schema: { type: integer }
+        - name: token
+          in: query
+          schema: { type: string }
+        - name: destinationAddress
+          in: query
+          description: Exact-match on the canonicalized destination.
+          schema: { type: string }
+        - name: sourceAddress
+          in: query
+          description: |
+            HD address that funded the payout. Populated only after
+            `selectSource` runs, so this filter implicitly excludes `planned`
+            rows.
+          schema: { type: string }
+        - name: batchId
+          in: query
+          description: |
+            Return only payouts belonging to a specific batch (the `batchId`
+            returned by `POST /payouts/batch`). Null-matched rows are excluded.
+          schema: { type: string }
+        - name: createdFrom
+          in: query
+          description: Inclusive lower bound on `createdAt`. ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: createdTo
+          in: query
+          description: Inclusive upper bound on `createdAt`. ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Paginated list of payouts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payouts, limit, offset, hasMore]
+                properties:
+                  payouts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Payout" }
+                  limit: { type: integer }
+                  offset: { type: integer }
+                  hasMore: { type: boolean }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [payouts]
+      summary: Plan a payout
+      description: |
+        Creates a payout in `planned` state. A background job
+        (`executeReservedPayouts`) picks an HD source by ledger balance,
+        writes reservations, and either broadcasts directly or — if the
+        source lacks native for gas — first broadcasts a sponsor → source
+        top-up (transitioning the parent through `topping-up`) before
+        broadcasting the main payout. Confirmation is surfaced via
+        `payout.*` webhooks or a subsequent GET.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlanPayoutInput" }
+      responses:
+        "201":
+          description: Payout planned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/payouts/estimate:
+    post:
+      tags: [payouts]
+      summary: Quote fee tiers + preview the source the executor will pick
+      description: |
+        Returns low/medium/high fee quotes AND the HD source address the
+        executor would pick from, all WITHOUT planning anything or writing
+        a reservation. The operator can preview where the payout will come
+        from, see whether a JIT gas top-up is required, and pick a tier
+        before committing the real `POST /api/v1/payouts`.
+
+        Source selection follows the same algorithm as the executor:
+          1. Tier A — pick the richest HD address (by token balance) that
+             ALSO has enough native for gas. No top-up, no `topUp` field.
+          2. Tier B — if no address has both, pick the richest token holder
+             and propose a sponsor with native to cover the gas top-up.
+             `topUp.required=true` is set; `topUp.sponsor` is non-null when
+             a funded sponsor exists, null when none does.
+          3. If no token holder has enough, `source` is null and `warnings`
+             carries `no_source_address_has_sufficient_token_balance`.
+
+        For native payouts (token == chain native), tier B is impossible
+        — gas IS the asset. If the only candidate has balance ≈ amount
+        but not enough headroom for gas, the endpoint throws
+        `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` (400). Error `details` carries:
+        - `suggestedAmountRaw` — uint256 in the token's smallest unit,
+          for programmatic pre-fill.
+        - `suggestedAmount` — human-decimal ("0.029"), for button text.
+        - `suggestedAmountUsd` — best-effort USD ("0.03"), for the
+          operator's sanity check. `null` when the price oracle is
+          unavailable — the raw + decimal forms are still present.
+
+        Tier semantics by chain family:
+          - **EVM**: priority-fee multipliers on viem's `estimateFeesPerGas`
+            (0.8× / 1.0× / 1.5×). `tieringSupported=true` except on legacy
+            non-EIP-1559 chains, which return the three tiers identical.
+          - **Solana**: 25th / 50th / 75th percentile of recent
+            `getRecentPrioritizationFees` samples, combined with a fixed
+            200k-CU allocation. `tieringSupported=false` when no recent
+            samples — conservative fallback prices are used instead.
+          - **Tron**: three tiers always identical; Tron has no priority
+            concept. `tieringSupported=false`.
+
+        Amount resolution is identical to `POST /api/v1/payouts` (raw /
+        decimal / USD-pegged via oracle). Oracle outage: `503 ORACLE_FAILED`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlanPayoutInput" }
+      responses:
+        "200":
+          description: Fee-tier quote
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PayoutFeeEstimate" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/payouts/batch:
+    post:
+      tags: [payouts]
+      summary: Plan up to 100 payouts in one call
+      description: |
+        Mass-create endpoint. Each row is validated and planned independently
+        — per-row errors DO NOT abort the batch. Every successfully-planned
+        row carries the same `batchId` so operators can list them together
+        via `GET /payouts?batchId=<id>`.
+
+        **Rate limit:** consumes N tokens from the merchant's `merchantPerMinute`
+        quota (proportional, not per-request). A 100-row batch costs 100
+        quota; exceeding available quota returns 429 with `retry-after`.
+
+        **Atomicity:** per-row. Batches never half-commit at the DB level;
+        each successful row is its own `INSERT`. The whole request is HTTP
+        200 on partial success — the client inspects `results[]` for per-row
+        outcomes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PayoutBatchInput" }
+      responses:
+        "200":
+          description: Batch processed (may include per-row failures)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PayoutBatchResponse" }
+        "400":
+          description: Batch-level validation error (oversize, wrong body shape, all-row schema failure)
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/payouts/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [payouts]
+      summary: Fetch a payout
+      responses:
+        "200":
+          description: Payout found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/payouts/{id}/cancel:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [payouts]
+      summary: Cancel a reserved payout
+      description: |
+        Cancels a payout that's still in `reserved` status — releases its
+        source + (when present) sponsor reservations so the balance is
+        immediately available to a subsequent plan.
+
+        Once a broadcast has started (`topping-up`, `submitted`, or
+        terminal states) the gateway can't recall the on-chain tx; the
+        endpoint returns **409 PAYOUT_NOT_CANCELABLE**. Idempotent on
+        already-canceled rows (returns 200 with the existing canceled row).
+
+        Does NOT currently emit a `payout.canceled` webhook event — the
+        merchant sees the result via the 200 response. If you rely on
+        webhooks, poll `GET /payouts/:id` after issuing cancel until
+        status is terminal.
+      responses:
+        "200":
+          description: Canceled (or idempotent re-cancel of an already-canceled row)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: |
+            Payout not found, OR cross-merchant access (the gateway returns 404
+            rather than 403 to avoid leaking payout ids across merchants).
+        "409":
+          description: |
+            `PAYOUT_NOT_CANCELABLE` — the payout has already broadcast on-chain
+            (status is `topping-up`, `submitted`, `confirmed`, or `failed`).
+
+  /checkout/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [checkout]
+      summary: Public invoice snapshot (for checkout UIs)
+      description: |
+        Narrow projection of an invoice suitable for end-user pages. The merchant
+        identity and any merchant-private metadata are deliberately excluded.
+        Rate limited per IP.
+      security: []
+      responses:
+        "200":
+          description: Invoice snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invoice: { $ref: "#/components/schemas/PublicInvoice" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /webhooks/alchemy:
+    post:
+      tags: [webhooks]
+      summary: Ingest Alchemy Notify ADDRESS_ACTIVITY webhooks
+      description: |
+        HMAC-SHA256 of the raw body under the per-webhook signing key
+        (looked up by `event.webhookId` in the encrypted-at-rest
+        `alchemy_webhook_registry` table) must match `X-Alchemy-Signature`.
+        Returns 200 fast and processes the payload in the background;
+        Alchemy retries on non-2xx.
+      security:
+        - AlchemySignature: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Acknowledged; ingest happens in background
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean, const: true }
+        "400": { description: Malformed JSON after a valid signature }
+        "401": { description: Missing or bad signature }
+        "404": { description: Alchemy ingest not enabled on this deployment }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /admin/merchants:
+    get:
+      tags: [admin]
+      summary: List merchants
+      description: |
+        Paginated listing, newest first. Never leaks `api_key_hash` or
+        `webhook_secret_ciphertext`. Use `?active=true|false` to scope to
+        live or deactivated rows.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+        - in: query
+          name: active
+          schema: { type: string, enum: [true, false] }
+      responses:
+        "200":
+          description: Merchants page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Merchant" }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+    post:
+      tags: [admin]
+      summary: Create a merchant
+      description: |
+        Returns the plaintext API key ONCE in the response. The hash is
+        stored; the plaintext is unrecoverable afterward.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 128 }
+                webhookUrl: { type: string, format: uri }
+                webhookSecret:
+                  type: string
+                  description: Optional hex-encoded 32-byte HMAC signing secret. Generated if omitted.
+                  pattern: "^[0-9a-f]{64}$"
+                paymentToleranceUnderBps:
+                  type: integer
+                  minimum: 0
+                  maximum: 2000
+                  default: 0
+                  description: |
+                    Default invoice under-payment tolerance in basis points.
+                    A paid USD amount ≥ `amountUsd × (1 − bps/10_000)` closes
+                    the invoice as `confirmed`. Example: `100` = 1 % — paying
+                    99 USD on a 100 USD invoice still confirms.
+                paymentToleranceOverBps:
+                  type: integer
+                  minimum: 0
+                  maximum: 2000
+                  default: 0
+                  description: |
+                    Default invoice over-payment tolerance in basis points.
+                    A paid USD amount ≤ `amountUsd × (1 + bps/10_000)` closes
+                    the invoice as `confirmed` (not `overpaid`). Example: `100`
+                    = 1 % — paying 101 USD on a 100 USD invoice confirms.
+                addressCooldownSeconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 604800
+                  default: 0
+                  description: |
+                    Address-pool cooldown in seconds. After an invoice reaches a
+                    terminal state, the pool address it held cannot be re-allocated
+                    to a different invoice for this many seconds. Late payments
+                    arriving during the cooldown still credit the original invoice
+                    via the orphan + admin-attribute path. `0` (default) preserves
+                    legacy immediate-reuse behavior. Capped at 7 days (604800s).
+      responses:
+        "201":
+          description: Merchant created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      webhookUrl: { type: [string, "null"] }
+                      active: { type: boolean }
+                      paymentToleranceUnderBps: { type: integer, minimum: 0, maximum: 2000 }
+                      paymentToleranceOverBps: { type: integer, minimum: 0, maximum: 2000 }
+                      addressCooldownSeconds: { type: integer, minimum: 0, maximum: 604800 }
+                      createdAt: { type: string, format: date-time }
+                  apiKey:
+                    type: string
+                    description: Plaintext API key. Shown once; store it immediately.
+                    pattern: "^sk_[0-9a-f]{64}$"
+                  webhookSecret:
+                    type: string
+                    description: Present only if `webhookUrl` was provided.
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
+  /admin/merchants/{id}:
+    get:
+      tags: [admin]
+      summary: Get a single merchant
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Merchant
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant: { $ref: "#/components/schemas/Merchant" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+    patch:
+      tags: [admin]
+      summary: Update a merchant
+      description: |
+        Mutates `name`, `webhookUrl`, and/or the three tuning defaults.
+        `active` has its own endpoints (`/deactivate`, `/activate`); the API
+        key rotates via `/rotate-key`; the webhook secret rotates via
+        `/rotate-webhook-secret`.
+
+        Special first-time `webhookUrl` case: if the merchant was created
+        without a webhook URL and this PATCH sets one, the gateway mints a
+        fresh HMAC secret, stores it encrypted, and returns the plaintext in
+        `webhookSecret` — same one-shot contract as the create endpoint.
+        Subsequent URL changes do NOT rotate the secret (signed-HMAC contract
+        stays stable; the merchant just receives on a different URL).
+
+        Tolerance changes apply to invoices created **after** the PATCH;
+        existing invoices keep the snapshot they were issued with. Cooldown
+        changes apply to releases that happen **after** the PATCH; already-
+        stamped `cooldownUntil` deadlines are unaffected.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 1, maxLength: 128 }
+                webhookUrl: { type: string, format: uri }
+                paymentToleranceUnderBps:
+                  type: integer
+                  minimum: 0
+                  maximum: 2000
+                paymentToleranceOverBps:
+                  type: integer
+                  minimum: 0
+                  maximum: 2000
+                addressCooldownSeconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 604800
+      responses:
+        "200":
+          description: Merchant updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      webhookUrl: { type: [string, "null"] }
+                      active: { type: boolean }
+                      paymentToleranceUnderBps: { type: integer }
+                      paymentToleranceOverBps: { type: integer }
+                      addressCooldownSeconds: { type: integer }
+                      updatedAt: { type: string, format: date-time }
+                  webhookSecret:
+                    type: string
+                    description: Plaintext webhook secret; present ONLY when this PATCH set a `webhookUrl` on a merchant that didn't previously have one. Shown once.
+                    pattern: "^[0-9a-f]{64}$"
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/merchants/{id}/rotate-key:
+    post:
+      tags: [admin]
+      summary: Rotate a merchant's API key
+      description: |
+        Generates a fresh `sk_<hex>` plaintext and replaces the stored hash.
+        The returned `apiKey` is the one and only chance to capture it. The
+        prior key is rejected on the next request. Webhook URL/secret are
+        intentionally not rotated here.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Key rotated; new plaintext returned once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      active: { type: boolean }
+                      updatedAt: { type: string, format: date-time }
+                  apiKey:
+                    type: string
+                    description: Plaintext API key. Shown once; store it immediately.
+                    pattern: "^sk_[0-9a-f]{64}$"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/merchants/{id}/rotate-webhook-secret:
+    post:
+      tags: [admin]
+      summary: Rotate a merchant's webhook HMAC signing secret
+      description: |
+        Generates a fresh 32-byte hex plaintext, encrypts at rest, and
+        returns the plaintext once so the operator can hand it to the
+        merchant.
+
+        **Coordinated-rotation caveat.** Outbox rows dispatched AFTER this
+        call — including any queued before the rotation — are signed with
+        the NEW secret (the dispatcher reads merchant state at send time).
+        The merchant's verifier must hold the new secret when those arrive
+        or they'll 401 and land in `webhook_deliveries.status='dead'`.
+        Sequence it: announce → rotate → hand secret off → merchant updates.
+        Failed retries can be replayed via
+        `POST /admin/webhook-deliveries/{id}/replay` once the merchant
+        confirms.
+
+        Requires the merchant to have a `webhookUrl` configured. For
+        first-time webhook setup, set the URL via `PATCH /admin/merchants/{id}`
+        instead — that flow mints a fresh secret automatically.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Webhook secret rotated; new plaintext returned once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      webhookUrl: { type: string, format: uri }
+                      active: { type: boolean }
+                      updatedAt: { type: string, format: date-time }
+                  webhookSecret:
+                    type: string
+                    description: Plaintext HMAC secret. Shown once; deliver to the merchant securely.
+                    pattern: "^[0-9a-f]{64}$"
+        "400":
+          description: Merchant has no `webhookUrl` — nothing to sign for
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/merchants/{id}/deactivate:
+    post:
+      tags: [admin]
+      summary: Deactivate a merchant
+      description: |
+        Sets `active=false`. Inbound API requests with the merchant's API
+        key are rejected with 401 while inactive. Idempotent. Deactivation
+        does NOT invalidate the stored key hash — reactivation restores
+        access with the same credential. Rotate the key first if deactivation
+        is prompted by a credential leak.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Merchant deactivated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      active: { type: boolean }
+                      updatedAt: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/merchants/{id}/activate:
+    post:
+      tags: [admin]
+      summary: Reactivate a merchant
+      description: Sets `active=true`. Idempotent.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Merchant activated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      active: { type: boolean }
+                      updatedAt: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/bootstrap/alchemy-webhooks:
+    post:
+      tags: [admin]
+      summary: Idempotently create Alchemy webhooks for the configured chains
+      description: |
+        For each requested chainId, checks whether an Alchemy ADDRESS_ACTIVITY
+        webhook already exists with the target URL + network; creates it if
+        not. Returns per-chain status plus the `signingKey` for any newly
+        created webhook. Signing keys are persisted encrypted into
+        `alchemy_webhook_registry` automatically; the `signingKey` field in
+        the response is a one-shot safety net in case persistence raced.
+        Requires `ALCHEMY_NOTIFY_TOKEN` env.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                chainIds:
+                  type: array
+                  items: { type: integer }
+                  description: Defaults to `ALCHEMY_CHAINS` env, then the mainnet set
+                seedAddressByChainId:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: Per-chain placeholder address (Alchemy requires ≥1 at create). Defaults to zero-address.
+              description: |
+                The target webhook URL is NOT accepted in the body. It is sourced from
+                `GATEWAY_PUBLIC_URL` env (base origin) plus the canonical path
+                `/webhooks/alchemy`. Env-only so a leaked ADMIN_KEY cannot be
+                used to redirect Alchemy's traffic to an arbitrary host.
+      responses:
+        "200":
+          description: Bootstrap complete; per-chain status in body
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        chainId: { type: integer }
+                        status:
+                          type: string
+                          enum: [created, existing, unsupported, failed]
+                        webhookId: { type: string }
+                        signingKey:
+                          type: string
+                          description: Only present when `status=created`. Automatically persisted to `alchemy_webhook_registry`; kept in the response as a one-shot safety net if `persisted=false`.
+                        error: { type: string }
+        "400":
+          description: Missing ALCHEMY_NOTIFY_TOKEN or GATEWAY_PUBLIC_URL env
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
+  /admin/chains:
+    get:
+      tags: [admin]
+      summary: Discovery — chains the gateway recognises and their bootstrap state
+      description: |
+        Read of the static chain registry, augmented with three readiness
+        booleans per chain so the dashboard can decide what still needs
+        bootstrapping in a single call:
+
+        - `wired`             — a `ChainAdapter` for the chainId is loaded in `deps.chains`
+        - `webhooksSupported` — chain *can* use Alchemy webhooks (EVM + Solana
+          chains Alchemy serves). False for Tron — it's RPC-poll only and has
+          no webhook concept. **Frontend should hide the "register webhook" CTA
+          when this is false.**
+        - `alchemyConfigured` — operator's `ALCHEMY_CHAINS` env actually
+          includes this chainId. Independent of whether a webhook is registered.
+        - `webhooks`          — a row exists in `alchemy_webhook_registry`.
+          Only meaningful when `webhooksSupported=true`; false-and-irrelevant
+          for RPC-poll chains.
+        - `feeWallets`        — at least one **active** fee wallet exists.
+        - `detection`         — `"alchemy"` when `webhooksSupported=true`, else
+          `"rpc-poll"`. Pure derived field surfaced so the frontend doesn't
+          have to know our chain-family taxonomy.
+        - `bootstrapReady`    — convenience: chain is fully provisioned for
+          payments + payouts. Formula adjusts for detection strategy:
+          `wired && (!webhooksSupported || webhooks) && feeWallets`. So Tron
+          can be ready with just `wired+feeWallets`, while EVM/Solana also need
+          `webhooks`.
+
+        The synthetic dev chain (chainId 999, slug `dev`) is **excluded** from
+        this response — it's a test-harness chain only and operators should
+        never attempt to register Alchemy webhooks or fee wallets for it.
+
+        Tokens come from the static `TOKEN_REGISTRY` — they are the same for
+        every operator and never include any per-merchant overrides. The
+        endpoint never returns secrets (signing keys, seeds, env values).
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: family
+          description: Narrow to one family.
+          schema: { type: string, enum: [evm, tron, solana] }
+        - in: query
+          name: wired
+          description: |
+            `true` returns only chains with a loaded adapter; `false` returns
+            registry-only entries; omit for both.
+          schema: { type: string, enum: [true, false] }
+      responses:
+        "200":
+          description: Chain inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [chains]
+                properties:
+                  chains:
+                    type: array
+                    items:
+                      type: object
+                      required: [chainId, slug, family, displayName, wired, webhooksSupported, alchemyConfigured, webhooks, feeWallets, detection, bootstrapReady, confirmationsRequired, tokens]
+                      properties:
+                        chainId: { type: integer }
+                        slug: { type: string, description: "Stable short id, e.g. 'ethereum' / 'tron-nile'." }
+                        family: { type: string, enum: [evm, tron, solana] }
+                        displayName: { type: string }
+                        wired: { type: boolean, description: "True when a ChainAdapter for this chainId is loaded." }
+                        webhooksSupported: { type: boolean, description: "True when this chain can use Alchemy Notify webhooks (EVM + Solana). False for RPC-poll chains like Tron — frontend should hide webhook CTAs." }
+                        alchemyConfigured: { type: boolean, description: "True when operator's ALCHEMY_CHAINS env includes this chainId." }
+                        webhooks: { type: boolean, description: "True when a row exists in alchemy_webhook_registry. Only meaningful if webhooksSupported is true." }
+                        feeWallets: { type: boolean, description: "True when at least one active fee wallet exists for this chainId." }
+                        detection: { type: string, enum: [alchemy, rpc-poll], description: "Which detection strategy this chain uses. Pure derived field for frontend convenience." }
+                        bootstrapReady: { type: boolean, description: "wired && (!webhooksSupported || webhooks) && feeWallets — webhook requirement is dropped for RPC-poll chains." }
+                        confirmationsRequired:
+                          type: integer
+                          description: "Confirmation threshold from `deps.confirmationThresholds`; transactions promote to `confirmed` at this count."
+                        tokens:
+                          type: array
+                          items:
+                            type: object
+                            required: [symbol, decimals, isStable, displayName]
+                            properties:
+                              symbol: { type: string }
+                              decimals: { type: integer }
+                              isStable: { type: boolean }
+                              displayName: { type: string }
+                              contractAddress:
+                                type: string
+                                nullable: true
+                                description: "Token contract / SPL mint address. Null for native assets (SOL, DEV)."
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
+  /admin/alchemy-webhooks:
+    get:
+      tags: [admin]
+      summary: List Alchemy webhook registrations (one per chain)
+      description: |
+        Read-only view of `alchemy_webhook_registry`. The dashboard uses this
+        to decide which chains are already wired versus which still need
+        bootstrapping via `POST /admin/bootstrap/alchemy-webhooks`.
+
+        The signing key is **never** returned (it's encrypted at rest via
+        `SECRETS_ENCRYPTION_KEY`). Operators who need to verify a key should
+        rotate it with `POST /admin/alchemy-webhooks/signing-keys`.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: chainId
+          description: Narrow to a single chain.
+          schema: { type: integer }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Paginated list of registered webhooks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [webhooks, limit, offset, hasMore]
+                properties:
+                  webhooks:
+                    type: array
+                    items:
+                      type: object
+                      required: [chainId, webhookId, webhookUrl, createdAt, updatedAt]
+                      properties:
+                        chainId: { type: integer }
+                        chain: { type: string, nullable: true, description: "Slug like 'ethereum' / 'polygon'; null when chainId is not in the static registry." }
+                        webhookId: { type: string }
+                        webhookUrl: { type: string, format: uri }
+                        createdAt: { type: string, format: date-time }
+                        updatedAt: { type: string, format: date-time }
+                  limit: { type: integer }
+                  offset: { type: integer }
+                  hasMore: { type: boolean }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
+  /admin/alchemy-webhooks/signing-keys:
+    post:
+      tags: [admin]
+      summary: Register an Alchemy webhook's signing key manually
+      description: |
+        For operators who created a webhook through the Alchemy dashboard UI
+        (not via bootstrap) or who need to push a key back in after a
+        persistence failure. The signing key is encrypted via
+        `SECRETS_ENCRYPTION_KEY` before being written to
+        `alchemy_webhook_registry`. Re-running with the same chainId upserts
+        (rotation after a dashboard delete+recreate).
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chainId, webhookId, signingKey, webhookUrl]
+              properties:
+                chainId: { type: integer }
+                webhookId: { type: string, minLength: 1, maxLength: 128 }
+                signingKey: { type: string, minLength: 1, maxLength: 256 }
+                webhookUrl: { type: string, format: uri }
+      responses:
+        "201":
+          description: Signing key persisted encrypted-at-rest
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  registered:
+                    type: object
+                    properties:
+                      chainId: { type: integer }
+                      webhookId: { type: string }
+                      webhookUrl: { type: string, format: uri }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
+  /admin/pool/initialize:
+    post:
+      tags: [admin]
+      summary: Seed or top up the address pool per family
+      description: |
+        Idempotent. Families already at or above `initialSize` return as
+        `already-sufficient` with zero additions. Families without a wired
+        chain adapter in deps.chains return as `skipped-no-adapter`. Safe to
+        call repeatedly and is the recovery path after a pool exhaustion.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        description: Empty body permitted; every field has a default.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                families:
+                  type: array
+                  minItems: 1
+                  items: { type: string, enum: [evm, tron, solana] }
+                  default: [evm, tron, solana]
+                initialSize:
+                  type: integer
+                  minimum: 1
+                  maximum: 500
+                  default: 5
+      responses:
+        "200":
+          description: Initialization outcomes per family
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        family: { type: string, enum: [evm, tron, solana] }
+                        status:
+                          type: string
+                          enum: [seeded, already-sufficient, skipped-no-adapter]
+                        added: { type: integer }
+        "400":
+          description: Malformed JSON (BAD_JSON) or invalid families/initialSize
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/pool/stats:
+    get:
+      tags: [admin]
+      summary: Per-family pool utilization snapshot
+      description: |
+        Operators watch this endpoint + an alert on available-count under a
+        threshold to catch "address supply running low" before POOL_EXHAUSTED
+        fires on a live invoice-create.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Pool statistics keyed by family
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        total: { type: integer }
+                        available: { type: integer }
+                        allocated: { type: integer }
+
+  /admin/webhook-deliveries:
+    get:
+      tags: [admin]
+      summary: List webhook deliveries by status
+      description: |
+        Operator view of the outbox. Use `status=dead` (default) to surface
+        deliveries that exhausted the retry schedule and need manual
+        intervention (merchant-side fix, then POST the replay endpoint).
+        `pending` shows rows still queued for retry; `delivered` shows
+        successful deliveries (mostly useful for audit).
+
+        ### Outbound event types (`eventType` field)
+
+        Invoice lifecycle (one row per status transition, idempotency key
+        `{event}:{invoiceId}:{status}`):
+          - `invoice.partial`, `invoice.detected`, `invoice.confirmed`,
+            `invoice.overpaid`, `invoice.expired`, `invoice.canceled`
+          - `invoice.demoted` — reorg un-confirmation; key includes
+            `{previousStatus}:{newStatus}` instead of one status
+
+        Per-transfer audit (one row per on-chain tx per stage; key
+        `{event}:{invoiceId}:{txHash}` so detect→confirm produces TWO
+        distinct rows for the same tx):
+          - `invoice.transfer_detected` — first sighting of a pending
+            transfer (push or poll). `data.payment.confirmations` is `0`
+            for push-detected, `n` for poll-detected.
+          - `invoice.payment_received` — same transfer reached the
+            confirmation threshold.
+
+        Payout lifecycle:
+          - `payout.submitted`, `payout.confirmed`, `payout.failed`
+
+        URL/secret resolution: per-resource override → merchant default
+        → silently skipped (with a `warn` log so operators can detect
+        misconfiguration). Body is signed with HMAC-SHA256 in
+        `X-Webhook-Signature`; merchants should de-dup on
+        `X-Webhook-Idempotency-Key`. Each row gets up to 5 outer retry
+        rounds × 4 inline HTTP attempts before going `dead`.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [pending, delivered, dead], default: dead }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Page of delivery rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        merchantId: { type: string }
+                        eventType: { type: string }
+                        status: { type: string, enum: [pending, delivered, dead] }
+                        attempts: { type: integer }
+                        lastStatusCode: { type: integer, nullable: true }
+                        lastError: { type: string, nullable: true }
+                        nextAttemptAt: { type: integer, nullable: true, description: "Epoch ms" }
+                        deliveredAt: { type: integer, nullable: true, description: "Epoch ms" }
+                        createdAt: { type: integer, description: "Epoch ms" }
+                        updatedAt: { type: integer, description: "Epoch ms" }
+        "400":
+          description: Unknown status value (BAD_STATUS)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/webhook-deliveries/{id}/replay:
+    post:
+      tags: [admin]
+      summary: Replay a dead webhook delivery
+      description: |
+        Resets a delivery from `dead` back to `pending` with `next_attempt_at`
+        set to now, so the next scheduled-jobs sweep re-drives it. Only rows
+        in `dead` status are replayable — `pending` rows are already queued
+        and `delivered` rows have already succeeded. Intended for when the
+        merchant has fixed the underlying cause of permanent failure (TLS
+        cert, URL change, etc.) and you want to push the event through.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Row reset to pending and queued for retry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  replayed:
+                    type: object
+                    properties:
+                      id: { type: string }
+                      nextAttemptAt: { type: integer, description: "Epoch ms" }
+        "404":
+          description: Delivery not found or not in dead status (NOT_DEAD)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/orphan-transactions:
+    get:
+      tags: [admin]
+      summary: List open orphan transactions
+      description: |
+        Orphans are detected on-chain transfers that could not be attributed
+        to an active invoice at ingest time — typically payments on an
+        address whose invoice has already expired / been canceled and whose
+        pool cooldown window has elapsed.
+
+        The list is backed by a partial index over `(chain_id, detected_at)`
+        WHERE `invoice_id IS NULL AND dismissed_at IS NULL`, so the queue
+        stays cheap even with millions of historical tx rows. Dismissed rows
+        are hidden but remain in `transactions` for audit.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: chainId
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - in: query
+          name: offset
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Open orphan queue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orphans:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        chainId: { type: integer }
+                        txHash: { type: string }
+                        logIndex: { type: [integer, "null"] }
+                        fromAddress: { type: string }
+                        toAddress: { type: string }
+                        token: { type: string }
+                        amountRaw: { type: string }
+                        amountUsd: { type: [string, "null"] }
+                        usdRate: { type: [string, "null"] }
+                        blockNumber: { type: [integer, "null"] }
+                        confirmations: { type: integer }
+                        status: { type: string, enum: [orphaned] }
+                        detectedAt: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/orphan-transactions/{id}/attribute:
+    post:
+      tags: [admin]
+      summary: Attribute an orphan transaction to an invoice
+      description: |
+        Re-points an orphan's `invoice_id` at the target invoice, promotes
+        its tx status (`orphaned` → `detected`/`confirmed` based on
+        confirmation count vs chain threshold), and runs
+        `recomputeInvoiceFromTransactions` with `viaAdminOverride=true`.
+
+        The override allows a terminal invoice (`expired` / `canceled`) to
+        flip to `confirmed` or `overpaid` when the attributed tx clears the
+        confirm bar. Partial credits against a terminal invoice stay parked
+        — the merchant's prior decision stands if the payment doesn't cover
+        the invoice.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invoiceId]
+              properties:
+                invoiceId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Orphan attributed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attribution:
+                    type: object
+                    properties:
+                      txId: { type: string }
+                      invoiceId: { type: string, format: uuid }
+                      invoiceStatusBefore: { type: string }
+                      invoiceStatusAfter: { type: string }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Transaction or invoice not found }
+        "409": { description: Transaction is not an open orphan (already attributed or dismissed) }
+
+  /admin/orphan-transactions/{id}/dismiss:
+    post:
+      tags: [admin]
+      summary: Dismiss an orphan transaction
+      description: |
+        Marks an orphan as reviewed-and-ignored by stamping `dismissed_at`
+        and `dismiss_reason`. The row stays in `transactions` for audit but
+        drops out of the open-orphans queue via the partial index.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 512 }
+      responses:
+        "200":
+          description: Orphan dismissed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dismissal:
+                    type: object
+                    properties:
+                      txId: { type: string }
+                      dismissedAt: { type: string, format: date-time }
+                      reason: { type: string }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Transaction not found }
+        "409": { description: Transaction is attributed or already dismissed }
+
+  /admin/audit-address:
+    post:
+      tags: [admin]
+      summary: Audit an address by diffing on-chain history against stored transactions
+      description: |
+        Queries the chain adapter's `scanIncoming` for every registered token
+        on `chainId` (plus the native symbol), diffs results against
+        `transactions`, and ingests missing rows through the normal ingest
+        path. Idempotent — already-stored txs are silently skipped via the
+        UNIQUE `(chain_id, tx_hash, log_index)` constraint.
+
+        Use when a merchant reports a missing payment: operator runs audit
+        against the invoice's receive address, and any newly-discovered
+        transfer either credits the invoice (if it's still active) or lands
+        as an orphan for attribution / dismissal.
+
+        `sinceMs` defaults to 30 days before the current server time; the
+        adapter's own max-scan window still clamps the final range.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chainId, address]
+              properties:
+                chainId: { type: integer, minimum: 1 }
+                address: { type: string, minLength: 1, maxLength: 128 }
+                sinceMs: { type: integer, minimum: 0, description: "Epoch ms lower bound; defaults to now - 30 days" }
+      responses:
+        "200":
+          description: Audit complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  audit:
+                    type: object
+                    properties:
+                      chainId: { type: integer }
+                      address: { type: string }
+                      sinceMs: { type: integer }
+                      scanned: { type: integer, description: "Total transfers returned by the chain adapter" }
+                      inserted: { type: integer, description: "Newly-added tx rows" }
+                      alreadyPresent: { type: integer, description: "Rows skipped (already in transactions)" }
+                      insertedTxIds:
+                        type: array
+                        items: { type: string }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/balances:
+    get:
+      tags: [admin]
+      summary: Snapshot gateway-owned address balances (DB-derived by default)
+      description: |
+        Returns per-address + per-chain + per-family token balances with USD
+        totals, shaped as:
+
+          token → address → chain → family → grand total
+
+        Each level carries its own `totalUsd`. The top-level `source` field
+        tells the caller which math produced the numbers: `"db"` or `"rpc"`.
+
+        ### Mode — `source="db"` (default, fast)
+
+        Computes balances from recorded activity only — no RPC traffic:
+
+          * spendable = SUM(`transactions.amountRaw` confirmed inbound)
+            − SUM(`payouts.amountRaw` confirmed outbound from this address)
+            − SUM(active `payout_reservations.amountRaw` for this address),
+            clamped at 0.
+
+        Returns in ~50ms regardless of pool size. Addresses with no
+        recorded activity are omitted. **Caveat:** off-system movements
+        are invisible (rare on chains with Alchemy webhooks; dust sent to
+        unsubscribed addresses). Use `?live=true` when reconciling.
+
+        ### Mode — `source="rpc"` (opts-in via `?live=true`)
+
+        Asks every wired chain adapter for the live on-chain balance of
+        every (address, chainId) pair. Authoritative but expensive:
+        typical 15–30s cold for a full mainnet pool. Use for post-topup
+        reconciliation or audit; do not bind to dashboard auto-refresh.
+
+        Pricing (both modes): USD rates are fetched once per snapshot via
+        `priceOracle.getUsdRates([...symbols])`. Tokens the oracle can't
+        price get `usdRate=null` and `usd="0.00"` so callers can
+        distinguish "really zero" from "couldn't price".
+
+        ### Caching
+
+        Keyed by mode + query string (`family`, `chainId`, `kind`,
+        `address`). DB mode uses a 5s TTL (it's cheap to recompute);
+        RPC mode uses 60s (dashboard refresh would otherwise hammer the
+        provider). `db` and `rpc` entries do not share a slot. The
+        response includes `cached: true|false` so dashboards can show
+        staleness.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: family
+          schema: { type: string, enum: [evm, tron, solana] }
+          description: Narrow to one family.
+        - in: query
+          name: chainId
+          schema: { type: integer }
+          description: Narrow to one chainId. Implicitly narrows family.
+        - in: query
+          name: kind
+          schema: { type: string, enum: [pool] }
+          description: |
+            Address kind filter. Only `pool` exists today — every HD address
+            is a payout source. The legacy `fee` value is silently coerced
+            to `pool` for backward compatibility with old clients.
+        - in: query
+          name: address
+          schema: { type: string }
+          description: Spot-check one address without paying the full sweep cost.
+        - in: query
+          name: live
+          schema: { type: string, enum: ["true", "1"] }
+          description: |
+            Flip to `true` or `1` to force a live RPC snapshot
+            (`source="rpc"`). Omit for the fast DB-derived default.
+      responses:
+        "200":
+          description: Snapshot computed (or served from cache)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [snapshot, cached]
+                properties:
+                  snapshot: { $ref: "#/components/schemas/BalanceSnapshot" }
+                  cached:
+                    type: boolean
+                    description: True when this response came from the in-memory cache instead of a fresh compute.
+        "400":
+          description: Invalid query parameter (BAD_FAMILY, BAD_CHAIN_ID, BAD_KIND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/pool/audit:
+    get:
+      tags: [admin]
+      summary: Audit every address_pool row against current MASTER_SEED derivation
+      description: |
+        Walks the pool, derives the expected address for each row's
+        `address_index` using the current `MASTER_SEED` + the family's
+        adapter, and compares to the stored address. Mismatches mean the
+        gateway can NOT sign for those rows — either `MASTER_SEED` rotated
+        since the pool was populated, or the rows were inserted by some
+        external tool that doesn't match our HD path.
+
+        Run this before funding a new pool with real money, after any
+        deployment where the seed might have changed, or when a payout
+        fails with a signer-mismatch error. The endpoint is read-only and
+        doesn't modify state.
+
+        Response `status` is `healthy` when no mismatches exist across any
+        family; `mismatches-detected` otherwise. Each family's report
+        lists up to the first 500 mismatched rows; operators with larger
+        pools get a warning via `unscannedBeyondLimit > 0` and should
+        paginate by dropping the rows they've already fixed and re-running.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Audit outcome
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, mismatches-detected]
+                  scanLimit:
+                    type: integer
+                    description: Max rows inspected per family in one call.
+                  reports:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        family: { type: string, enum: [evm, tron, solana] }
+                        scanned: { type: integer }
+                        matches: { type: integer }
+                        unscannedBeyondLimit: { type: integer }
+                        mismatches:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              family: { type: string, enum: [evm, tron, solana] }
+                              addressIndex: { type: integer }
+                              storedAddress: { type: string }
+                              expectedAddress: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets:
+    get:
+      tags: [admin, fee-wallets]
+      summary: List per-family fee-wallet configuration
+      description: |
+        Returns one entry per chain family (`evm`, `tron`, `solana`). Each
+        entry reports:
+          - `capability`: what the family's adapter supports for offloading
+            payout gas onto a dedicated wallet. Values:
+              - `none`     — family cannot use a fee wallet today (EVM).
+              - `delegate` — fee wallet stakes native + delegates resources
+                             to pool addresses (Tron `DelegateResource`).
+              - `co-sign`  — fee wallet signs every payout as fee payer
+                             (Solana `message.feePayer`).
+          - `configured`: null when no wallet is registered, else
+            `{ mode, address }`. `mode='hd-pool'` means the address is an
+            existing pool row whose key is derived from MASTER_SEED;
+            `mode='imported'` means an external key was uploaded and is
+            encrypted at rest via secretsCipher.
+
+        Operators read this to render a dashboard showing where fee wallets
+        are set vs missing, and to decide whether the selected family is
+        ready for the gas-offload topology.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Per-family configuration matrix
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallets:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        family:
+                          type: string
+                          enum: [evm, tron, solana]
+                        capability:
+                          type: string
+                          enum: [none, delegate, co-sign]
+                        configured:
+                          oneOf:
+                            - type: "null"
+                            - type: object
+                              properties:
+                                mode: { type: string, enum: [hd-pool, imported] }
+                                address: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/{family}/use-pool:
+    post:
+      tags: [admin, fee-wallets]
+      summary: Register an existing HD pool address as the family's fee wallet
+      description: |
+        Zero-new-secret setup. The supplied address must already live in
+        `address_pool` for this family — we verify that before writing the
+        row. Signing still goes through MASTER_SEED + the pool row's
+        `address_index`, identical to how pool payouts already derive keys.
+
+        The planner immediately respects the registration on the next
+        `POST /payouts` or `POST /payouts/estimate`. No restart needed.
+
+        To swap to a different address: `DELETE` then `POST` again. To swap
+        between modes: same — the `fee_wallets` row's uniqueness is per
+        family.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: family
+          in: path
+          required: true
+          schema: { type: string, enum: [evm, tron, solana] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address:
+                  type: string
+                  description: Canonical form for the family (hex for EVM, base58 for Tron/Solana).
+      responses:
+        "200":
+          description: Registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet:
+                    type: object
+                    properties:
+                      family: { type: string }
+                      mode: { type: string, enum: [hd-pool] }
+                      address: { type: string }
+        "400":
+          description: |
+            BAD_FAMILY, BAD_JSON, NO_ADAPTER (family not wired), or
+            INVALID_ADDRESS (not a valid address for this family).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: POOL_ADDRESS_NOT_FOUND — address does not live in address_pool for this family.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/{family}/import:
+    post:
+      tags: [admin, fee-wallets]
+      summary: Import an externally-generated private key as the fee wallet
+      description: |
+        Use when you have an external wallet whose key you want to reuse —
+        for example, a Tron wallet that has already accumulated staked TRX
+        and whose 14-day unfreeze cooldown you don't want to pay to reset.
+
+        The private key is encrypted at the boundary via `secretsCipher`
+        (AES-256-GCM, same primitive used for webhook HMAC secrets and
+        Alchemy signing keys). Plaintext is only in memory for the duration
+        of the encrypt call. At sign time, the ciphertext is decrypted for
+        one `signAndBroadcast` call and the buffer is immediately zeroed.
+
+        **Cross-checked at import time:** the declared `address` is
+        verified against the private key's derived address via the adapter's
+        `addressFromPrivateKey`. A mismatch returns 400
+        `ADDRESS_KEY_MISMATCH` with both values in the error message — no
+        row is persisted. This prevents a silent signer-mismatch failure on
+        the first payout.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: family
+          in: path
+          required: true
+          schema: { type: string, enum: [evm, tron, solana] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [privateKey, address]
+              properties:
+                privateKey:
+                  type: string
+                  description: Hex-encoded private key (with or without 0x prefix). Length per family.
+                address:
+                  type: string
+                  description: Canonical form for the family; must match the key's derived address.
+      responses:
+        "200":
+          description: Registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet:
+                    type: object
+                    properties:
+                      family: { type: string }
+                      mode: { type: string, enum: [imported] }
+                      address: { type: string }
+        "400":
+          description: |
+            BAD_FAMILY, BAD_JSON, NO_ADAPTER, INVALID_ADDRESS,
+            INVALID_PRIVATE_KEY (key could not be parsed for this family), or
+            ADDRESS_KEY_MISMATCH (declared address doesn't match key).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/{family}:
+    delete:
+      tags: [admin, fee-wallets]
+      summary: Remove the fee wallet registration for a family
+      description: |
+        Idempotent. The planner immediately falls back to the self-pay /
+        sponsor-topup flow on the next plan; in-flight payouts are
+        unaffected because fee-wallet selection is a per-plan decision.
+
+        Removing does NOT unfreeze staked TRX or unsend any previously-
+        submitted delegation transactions — for Tron specifically, call
+        `/admin/fee-wallets/tron/undelegate` on each delegated address and
+        `/admin/fee-wallets/tron/unfreeze` on any frozen stake before
+        removing, or the funds stay locked on-chain.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: family
+          in: path
+          required: true
+          schema: { type: string, enum: [evm, tron, solana] }
+      responses:
+        "200":
+          description: Removal result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed:
+                    type: boolean
+                    description: True when a row was deleted; false when no row existed.
+        "400":
+          description: BAD_FAMILY
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/resources:
+    get:
+      tags: [admin, fee-wallets, tron]
+      summary: Query the Tron fee wallet's staking/delegation resource budget
+      description: |
+        Reads `/wallet/getaccountresource` against the registered Tron fee
+        wallet and returns its energy + bandwidth budgets. Operators poll
+        this to decide when to stake more TRX, re-delegate, or audit a
+        suspected delegation shortfall.
+
+        `energyAvailable` and `bandwidthAvailable` fields include both the
+        account's own stake AND resources delegated IN to it; they're what
+        the chain actually lets the account consume today before burning.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Resource snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet: { type: string, description: Fee wallet address (base58). }
+                  resources:
+                    type: object
+                    properties:
+                      energyAvailable: { type: integer, description: Energy units still consumable today. }
+                      energyLimit: { type: integer, description: Daily energy budget from own stake + delegations in. }
+                      bandwidthAvailable: { type: integer, description: Bytes still consumable today (incl. ~600/day free). }
+                      bandwidthLimit: { type: integer, description: Daily bandwidth budget. }
+        "409":
+          description: NO_FEE_WALLET — Tron fee wallet is not registered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: NO_TRON_ADAPTER — Tron adapter is not wired.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/freeze:
+    post:
+      tags: [admin, fee-wallets, tron]
+      summary: Stake TRX on the Tron fee wallet for energy or bandwidth
+      description: |
+        Wraps `/wallet/freezebalancev2`. Converts spendable TRX on the fee
+        wallet into staked TRX, which generates a daily resource allowance
+        (ENERGY for TRC-20 execution, BANDWIDTH for tx bytes). Stake is
+        reclaimable via `/unfreeze` (14-day unlock), not burned.
+
+        Signed with the fee wallet's key (resolved via signerStore), broadcast
+        via the same `signAndBroadcast` path production payouts use.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [balance, resource]
+              properties:
+                balance:
+                  type: integer
+                  description: TRX to stake, in sun (1 TRX = 1,000,000 sun).
+                  minimum: 1000000
+                resource:
+                  type: string
+                  enum: [ENERGY, BANDWIDTH]
+      responses:
+        "200":
+          description: Broadcast; resources become active on confirmation (~3s)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash: { type: string }
+                  balance: { type: integer }
+                  resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+        "400":
+          description: BAD_JSON
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: NO_FEE_WALLET
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/unfreeze:
+    post:
+      tags: [admin, fee-wallets, tron]
+      summary: Begin the 14-day unstaking cooldown on the Tron fee wallet
+      description: |
+        Wraps `/wallet/unfreezebalancev2`. TRX becomes withdrawable 14 days
+        after broadcast. Useful when rebalancing or decommissioning a fee
+        wallet. Call `/undelegate` FIRST on any active delegations or the
+        call will fail (can't unstake what's currently lent out).
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [balance, resource]
+              properties:
+                balance:
+                  type: integer
+                  description: Sun to unfreeze.
+                  minimum: 1000000
+                resource:
+                  type: string
+                  enum: [ENERGY, BANDWIDTH]
+      responses:
+        "200":
+          description: Broadcast; withdrawable after 14-day cooldown
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash: { type: string }
+                  balance: { type: integer }
+                  resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+        "400": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: BAD_JSON }
+        "409": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: NO_FEE_WALLET }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/delegate:
+    post:
+      tags: [admin, fee-wallets, tron]
+      summary: Delegate staked resources from the Tron fee wallet to a pool address
+      description: |
+        Wraps `/wallet/delegateresource`. The fee wallet lends a slice of
+        its staked resource to `receiver` — the receiver can then consume
+        that energy/bandwidth for its own transactions without burning TRX.
+        Delegation persists until undelegated (or until `lock_period`
+        expires when `lock=true`).
+
+        The handler verifies whether `receiver` is a pool address (reports
+        `receiverIsInPool`) but permits delegation to non-pool addresses
+        too — intended for one-off delegations to sweep-master / sponsor
+        addresses.
+
+        Typical setup: loop this call across every active pool address so
+        USDT/USDC payouts from any of them consume delegated energy
+        instead of burning TRX.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [receiver, balance, resource]
+              properties:
+                receiver:
+                  type: string
+                  description: Base58 address to receive delegated resources.
+                balance:
+                  type: integer
+                  description: STAKE amount in sun to delegate (not the energy amount — the delegated stake produces a network-variable energy-per-day rate).
+                  minimum: 1000000
+                resource:
+                  type: string
+                  enum: [ENERGY, BANDWIDTH]
+                lock:
+                  type: boolean
+                  description: When true, delegation cannot be reclaimed for 3 days. Defaults false.
+      responses:
+        "200":
+          description: Delegation broadcast
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash: { type: string }
+                  receiver: { type: string }
+                  balance: { type: integer }
+                  resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+                  lock: { type: boolean }
+                  receiverIsInPool: { type: boolean }
+        "400": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: BAD_JSON }
+        "409": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: NO_FEE_WALLET }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/undelegate:
+    post:
+      tags: [admin, fee-wallets, tron]
+      summary: Reclaim delegated resources from a pool address
+      description: |
+        Wraps `/wallet/undelegateresource`. Returns delegated stake to the
+        fee wallet's free pool. Must be called BEFORE `/unfreeze` on any
+        delegated stake — Tron rejects an unfreeze that would leave active
+        delegations unfunded.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [receiver, balance, resource]
+              properties:
+                receiver: { type: string }
+                balance: { type: integer, minimum: 1000000 }
+                resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+      responses:
+        "200":
+          description: Undelegate broadcast
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash: { type: string }
+                  receiver: { type: string }
+                  balance: { type: integer }
+                  resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+        "400": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: BAD_JSON }
+        "409": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: NO_FEE_WALLET }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/migrate:
+    post:
+      tags: [admin]
+      summary: Apply any pending schema migrations
+      description: |
+        Runs the bundled migration set through the idempotent migration-runner.
+        Already-applied ids are skipped. On Workers/Vercel-Edge (no filesystem
+        at runtime) this endpoint returns 501 — operators use `wrangler d1
+        migrations apply` or the Turso migration CLI instead.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Migration sweep result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applied:
+                    type: array
+                    items: { type: string }
+                  skipped:
+                    type: array
+                    items: { type: string }
+        "501":
+          description: No bundled migration set on this runtime (MIGRATIONS_NOT_BUNDLED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /internal/cron/tick:
+    post:
+      tags: [internal]
+      summary: Trigger the full scheduled-jobs sweep
+      description: |
+        Used by Vercel Cron / Upstash QStash / external schedulers. Returns
+        per-job outcomes so a slow provider in one step doesn't mask failures
+        elsewhere.
+      security:
+        - CronSecret: []
+      responses:
+        "200":
+          description: Sweep completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  result:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        ok: { type: boolean }
+                        error: { type: string }
+        "401": { description: Missing or wrong Bearer token }
+        "404": { description: Cron endpoint not enabled (CRON_SECRET not set) }
+
+components:
+  securitySchemes:
+    MerchantApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        Merchant API key returned once at `POST /admin/merchants`.
+        Also accepted as `X-API-Key: <key>`.
+    AdminKey:
+      type: http
+      scheme: bearer
+      description: Shared admin key from `ADMIN_KEY` env. Also accepted as `X-Admin-Key`.
+    AlchemySignature:
+      type: apiKey
+      in: header
+      name: X-Alchemy-Signature
+      description: HMAC-SHA256 hex of the raw body under the per-webhook signing key stored in `alchemy_webhook_registry` (looked up by `event.webhookId`).
+    CronSecret:
+      type: http
+      scheme: bearer
+      description: Shared secret from `CRON_SECRET` env.
+
+  headers:
+    X-Request-Id:
+      description: UUID correlation id. Accepts a caller-supplied value if it's a valid UUID; otherwise minted.
+      schema: { type: string, format: uuid }
+    X-RateLimit-Limit:
+      description: Window cap for this route's rate-limit scope
+      schema: { type: integer }
+    X-RateLimit-Remaining:
+      description: Requests left in the current window after this one
+      schema: { type: integer }
+    X-RateLimit-Reset:
+      description: Unix seconds when the window rolls
+      schema: { type: integer }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MerchantInactive:
+      description: Merchant is deactivated
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Entity not found (or not owned by this merchant)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Request body failed schema validation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests in the current window
+      headers:
+        Retry-After:
+          description: Seconds until the window rolls
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Merchant:
+      type: object
+      description: |
+        Merchant row as returned by the admin GET endpoints. Secret-adjacent
+        fields (`api_key_hash`, `webhook_secret_ciphertext`) are never
+        included.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        webhookUrl: { type: [string, "null"] }
+        active: { type: boolean }
+        paymentToleranceUnderBps: { type: integer, minimum: 0, maximum: 2000 }
+        paymentToleranceOverBps: { type: integer, minimum: 0, maximum: 2000 }
+        addressCooldownSeconds: { type: integer, minimum: 0, maximum: 604800 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code]
+          properties:
+            code: { type: string, description: Stable machine-readable code }
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+              description: Optional per-code payload (e.g. Zod issues on VALIDATION)
+
+    CreateInvoiceInput:
+      type: object
+      description: |
+        Provide EXACTLY ONE pricing mode:
+          - `amountUsd` — USD-pegged. Pair with `acceptedFamilies` to make the
+            invoice payable from any family/token the gateway supports. Rates
+            are pinned for 10 minutes at creation.
+          - `amountRaw` — legacy single-token. Payer must pay in `token` on
+            `chainId`, exact amount.
+          - `fiatAmount` + `fiatCurrency` — legacy fiat-quoted. Converted to
+            a token amount at creation via the price oracle.
+      properties:
+        chainId: { type: integer }
+        token:
+          type: string
+          pattern: "^[A-Z0-9]+$"
+          description: |
+            Any symbol registered on this `chainId`, including native gas
+            tokens (ETH/POL/BNB/AVAX/TRX/SOL) — natives are first-class
+            alongside USDC/USDT. Discover the valid symbols per chain via
+            `GET /admin/chains` (each row's `tokens` array).
+        amountUsd:
+          type: string
+          pattern: "^\\d+(\\.\\d{1,8})?$"
+          description: |
+            USD-pegged target — the invoice can be settled in **any
+            combination** of registered tokens at the receive address. Each
+            transfer is converted to USD via the rate snapshot at detection
+            time and summed. e.g. $50 USDC + $50 ETH satisfies a $100
+            invoice. Pair with `acceptedFamilies` to span every wired chain.
+        acceptedFamilies:
+          type: array
+          items: { type: string, enum: [evm, tron, solana] }
+          minItems: 1
+          description: |
+            Families the invoice will accept payment from. Each family gets one
+            allocated receive address. Omit for single-family (derived from
+            `chainId`'s family).
+        amountRaw:
+          type: string
+          pattern: "^\\d+$"
+          description: |
+            Raw token amount in smallest units (wei for 18-dec ETH/POL/BNB/AVAX,
+            sun for TRX, lamports for SOL, micro-units for 6-dec USDC/USDT).
+            Single-token invoices: only the quoted `token` credits toward this
+            target — wrong-token transfers at the receive address are logged for
+            audit but ignored. Use `amountUsd` if you want universal acceptance.
+        fiatAmount:
+          type: string
+          pattern: "^\\d+(\\.\\d+)?$"
+        fiatCurrency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+        externalId:
+          type: string
+          maxLength: 256
+          description: |
+            Merchant's opaque reference (e.g. cart id). Doubles as a Stripe-
+            style idempotency key: a second `POST /api/v1/invoices` from the
+            same merchant with the same `externalId` returns the original
+            invoice (HTTP 201 again, identical body) instead of creating a
+            duplicate. Safe to retry on network errors. Omit it and every
+            POST creates a new invoice.
+        metadata:
+          type: object
+          additionalProperties: true
+        expiresInMinutes:
+          type: integer
+          minimum: 1
+          maximum: 1440
+          default: 30
+        webhookUrl:
+          type: string
+          format: uri
+          description: |
+            Per-invoice webhook destination override. When set, dispatch for
+            this invoice's events goes here instead of the merchant-account
+            webhook. Must be supplied together with `webhookSecret` — passing
+            one without the other is a 400. Echoed in responses; the secret is
+            never returned.
+        webhookSecret:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: |
+            HMAC secret paired with `webhookUrl`. Encrypted at rest and never
+            echoed back. Required if `webhookUrl` is set.
+        paymentToleranceUnderBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Per-invoice under-payment tolerance override in basis points. Omit
+            to inherit the merchant default (snapshotted at create time). See
+            `POST /admin/merchants` for the math semantics.
+        paymentToleranceOverBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Per-invoice over-payment tolerance override in basis points. Omit
+            to inherit the merchant default.
+      required: [chainId, token]
+
+    Invoice:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [created, partial, detected, confirmed, overpaid, expired, canceled]
+        chainId: { type: integer }
+        token: { type: string }
+        receiveAddress: { type: string }
+        addressIndex: { type: integer }
+        acceptedFamilies:
+          type: array
+          items: { type: string, enum: [evm, tron, solana] }
+        receiveAddresses:
+          type: array
+          description: One entry per accepted family. The checkout UI renders all of them.
+          items:
+            type: object
+            properties:
+              family: { type: string, enum: [evm, tron, solana] }
+              address: { type: string }
+        requiredAmountRaw: { type: string }
+        receivedAmountRaw: { type: string }
+        fiatAmount: { type: [string, "null"] }
+        fiatCurrency: { type: [string, "null"] }
+        quotedRate: { type: [string, "null"] }
+        amountUsd:
+          type: [string, "null"]
+          description: USD target. Non-null only on USD-path invoices.
+        paidUsd:
+          type: [string, "null"]
+          description: Sum of confirmed transactions' USD value. Non-null on USD-path invoices.
+        overpaidUsd:
+          type: [string, "null"]
+          description: max(paidUsd - amountUsd, 0). Non-null on USD-path invoices.
+        rates:
+          type: [object, "null"]
+          additionalProperties: { type: string }
+          description: |
+            Pinned USD-per-token rates for this invoice's window (USD-path only).
+            Keys are token symbols, values are decimal strings.
+        rateWindowExpiresAt:
+          type: [string, "null"]
+          format: date-time
+        externalId: { type: [string, "null"] }
+        metadata: { type: [object, "null"] }
+        webhookUrl:
+          type: [string, "null"]
+          format: uri
+          description: |
+            Per-invoice webhook URL override (echo-only). Null when the
+            invoice falls back to the merchant-account webhook. The matching
+            secret is write-only and never returned.
+        paymentToleranceUnderBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Effective under-payment tolerance for this invoice in basis points
+            (snapshot of merchant default or per-invoice override at create time).
+        paymentToleranceOverBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Effective over-payment tolerance for this invoice in basis points
+            (snapshot of merchant default or per-invoice override at create time).
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    InvoiceAmountsBreakdown:
+      type: object
+      description: |
+        USD-axis breakdown of an invoice's progress. All fields null on legacy
+        single-token invoices (use `requiredAmountRaw` / `receivedAmountRaw`
+        on the invoice itself for those).
+      properties:
+        requiredUsd: { type: [string, "null"] }
+        confirmedUsd:
+          type: [string, "null"]
+          description: Sum of CONFIRMED contributing transactions' USD values.
+        confirmingUsd:
+          type: [string, "null"]
+          description: Sum of DETECTED-but-not-yet-confirmed transactions' USD values.
+        remainingUsd:
+          type: [string, "null"]
+          description: max(requiredUsd - confirmedUsd, 0).
+        overpaidUsd:
+          type: [string, "null"]
+          description: max(confirmedUsd - requiredUsd, 0).
+
+    InvoiceTransaction:
+      type: object
+      description: |
+        One on-chain payment tied to the invoice. All statuses (`detected`,
+        `confirmed`, `reverted`, `orphaned`) are returned so debugging can
+        see rows that no longer count toward the invoice total.
+      properties:
+        id: { type: string, format: uuid }
+        txHash: { type: string }
+        logIndex: { type: [integer, "null"] }
+        chainId: { type: integer }
+        chain:
+          type: [string, "null"]
+          description: Short slug like `ethereum`, `polygon`, `tron`, `solana`. Null if chainId is unknown to the registry.
+        token: { type: string }
+        fromAddress: { type: string }
+        toAddress: { type: string }
+        amountRaw:
+          type: string
+          description: Raw integer string in the token's smallest units.
+        amount:
+          type: string
+          description: Human-readable decimal (e.g. `"1"`, `"0.04"`). Convenience for UIs.
+        amountUsd:
+          type: [string, "null"]
+          description: USD valuation pinned at detection time.
+        usdRate: { type: [string, "null"] }
+        status:
+          type: string
+          enum: [detected, confirmed, reverted, orphaned]
+        confirmations: { type: integer }
+        blockNumber: { type: [integer, "null"] }
+        detectedAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+
+    InvoiceDetails:
+      type: object
+      description: Hydrated GET response — invoice plus USD breakdown plus per-tx detail.
+      required: [invoice, amounts, transactions]
+      properties:
+        invoice: { $ref: "#/components/schemas/Invoice" }
+        amounts: { $ref: "#/components/schemas/InvoiceAmountsBreakdown" }
+        transactions:
+          type: array
+          items: { $ref: "#/components/schemas/InvoiceTransaction" }
+
+    PublicInvoice:
+      type: object
+      description: Same as Invoice but with merchant-private fields stripped
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string }
+        chainId: { type: integer }
+        token: { type: string }
+        receiveAddress: { type: string }
+        requiredAmountRaw: { type: string }
+        receivedAmountRaw: { type: string }
+        fiatAmount: { type: [string, "null"] }
+        fiatCurrency: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+
+    PlanPayoutInput:
+      type: object
+      required: [chainId, token, destinationAddress]
+      description: |
+        Provide **exactly one** of `amountRaw`, `amount`, or `amountUSD`.
+        - `amountRaw` — uint256 string in the token's smallest unit (e.g. `"1000000"` for 1 USDC).
+        - `amount` — human decimal string (e.g. `"1.5"`); converted via BigInt
+          against `token.decimals`. Must not have more decimal places than the
+          token supports — e.g. USDC (6 decimals) accepts up to 6; rejected
+          with `BAD_AMOUNT` (400) otherwise.
+        - `amountUSD` — fiat-pegged decimal string (e.g. `"10.00"`); converted
+          via the price oracle at create time. The resolved rate is
+          snapshotted onto `quotedRate` and `quotedAmountUsd` for audit.
+          Supported on **all** tokens (stable + volatile). For non-stable
+          tokens (ETH/MATIC/…) the actual broadcast happens seconds-to-minutes
+          later, so the executed payout's market value drifts from
+          `amountUSD` — accepted as v1 cost. If the oracle is unavailable, the
+          create fails with `503 ORACLE_FAILED`; we never substitute a stale
+          rate.
+      properties:
+        chainId: { type: integer }
+        token:
+          type: string
+          description: |
+            Any symbol registered on this `chainId`, including native gas
+            tokens (ETH/POL/BNB/AVAX/TRX/SOL) — natives are first-class for
+            payouts, not just stablecoins. Discover the valid symbols per
+            chain via `GET /admin/chains` (each row's `tokens` array).
+        amountRaw:
+          type: string
+          pattern: "^\\d+$"
+          description: uint256 smallest-unit integer string. Mutually exclusive with `amount` / `amountUSD`.
+        amount:
+          type: string
+          pattern: "^(0|[1-9]\\d*)(\\.\\d+)?$"
+          description: Human decimal. Mutually exclusive with `amountRaw` / `amountUSD`.
+        amountUSD:
+          type: string
+          pattern: "^(0|[1-9]\\d*)(\\.\\d+)?$"
+          description: Fiat-pegged decimal. Mutually exclusive with `amountRaw` / `amount`.
+        destinationAddress: { type: string, minLength: 1, maxLength: 128 }
+        feeTier:
+          type: string
+          enum: [low, medium, high]
+          description: |
+            Optional fee tier for the broadcast tx. Meaningful today on chains
+            whose `tieringSupported` flag (from `GET /admin/chains` or
+            `POST /payouts/estimate`) is `true` — **EVM** binds
+            maxFeePerGas/maxPriorityFeePerGas at this tier via
+            `estimateFeesPerGas`-scaled multipliers (0.8× / 1.0× / 1.5×);
+            **Solana** binds a `setComputeUnitPrice` instruction at the 25th
+            / 50th / 75th percentile of recent prioritization fees. **Tron**
+            has no tier concept — the field is accepted for uniformity but
+            has no effect on broadcast.
+            When omitted, the chain's default (viem's default on EVM; no
+            priority fee on Solana) applies.
+        batchId:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Optional grouping id. Set automatically by `POST /payouts/batch`
+            to the same UUID on every row of a batch. Accepted on the
+            single-create path for uniformity but ignored there. Filter list
+            responses with `GET /payouts?batchId=<id>`.
+        webhookUrl:
+          type: string
+          format: uri
+          description: |
+            Per-payout webhook destination override. When set, dispatch for
+            this payout's events goes here instead of the merchant-account
+            webhook. Must be supplied together with `webhookSecret` — passing
+            one without the other is a 400. Echoed in responses; the secret is
+            never returned. SSRF-guarded: URLs pointing at loopback /
+            link-local / cloud-metadata addresses are rejected with
+            `INVALID_DESTINATION` at plan time.
+        webhookSecret:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: |
+            HMAC secret paired with `webhookUrl`. Encrypted at rest and never
+            echoed back. Required if `webhookUrl` is set.
+
+    PayoutFeeEstimate:
+      type: object
+      description: |
+        Fee-tier quote + source preview for a hypothetical payout. Returned
+        by `POST /api/v1/payouts/estimate`. The executor's `selectSource`
+        runs in dry-run mode here so the response shows EXACTLY what would
+        happen on a real plan: which HD address would fund the payout,
+        whether a JIT gas top-up is needed, and what alternatives exist.
+      required: [amountRaw, tiers, source, alternatives, warnings]
+      properties:
+        amountRaw:
+          type: string
+          description: Resolved raw amount for the quoted payout, in the token's smallest unit.
+        quotedAmountUsd: { type: [string, "null"] }
+        quotedRate: { type: [string, "null"] }
+        tiers:
+          type: object
+          required: [tieringSupported, nativeSymbol, low, medium, high]
+          properties:
+            tieringSupported: { type: boolean }
+            nativeSymbol: { type: string, description: "ETH / POL / BNB / AVAX / TRX / SOL." }
+            low: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+            medium: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+            high: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+        source:
+          type: [object, "null"]
+          description: |
+            HD address the executor would pick. Null when no candidate has
+            enough token balance (see `warnings`).
+          required: [address, derivationIndex, tokenBalance, nativeBalance]
+          properties:
+            address: { type: string }
+            derivationIndex: { type: integer }
+            tokenBalance: { type: string, description: "Spendable token balance (smallest units, ledger-derived)." }
+            nativeBalance: { type: string }
+        topUp:
+          type: object
+          description: |
+            Set ONLY when the chosen source lacks native gas and a separate
+            sponsor address must top it up before the main tx. Omitted
+            entirely when the source has both token and gas. `sponsor: null`
+            means a token-holding source exists but no funded sponsor —
+            payout will fail with `NO_GAS_SPONSOR_AVAILABLE` if planned.
+          required: [required, sponsor, amountRaw]
+          properties:
+            required: { type: boolean, enum: [true] }
+            sponsor:
+              type: [object, "null"]
+              required: [address, nativeBalance]
+              properties:
+                address: { type: string }
+                nativeBalance: { type: string }
+            amountRaw: { type: string, description: "Native amount the sponsor would send to the source (gas gap + 20% cushion)." }
+        alternatives:
+          type: array
+          maxItems: 4
+          description: |
+            Next-best HD source candidates by token balance descending,
+            for operator visibility. The picker would only fall back to
+            these on race or when the chosen `source` has insufficient
+            spendable at insert time.
+          items:
+            type: object
+            required: [address, derivationIndex, tokenBalance, nativeBalance]
+            properties:
+              address: { type: string }
+              derivationIndex: { type: integer }
+              tokenBalance: { type: string }
+              nativeBalance: { type: string }
+        warnings:
+          type: array
+          description: |
+            Non-fatal operator-facing notices. Known codes:
+              - `no_source_address_has_sufficient_token_balance` — `source: null`
+              - `no_gas_sponsor_available` — `topUp.sponsor: null`
+              - `fee_quote_unavailable` — chain RPC failed during tier quoting
+              - `max_amount_exceeds_net_spendable` — companion to the 400 error
+          items: { type: string }
+
+    PayoutFeeQuoteTier:
+      type: object
+      required: [tier, nativeAmountRaw, usdAmount]
+      properties:
+        tier: { type: string, enum: [low, medium, high] }
+        nativeAmountRaw:
+          type: string
+          description: Total fee in native smallest units (wei on EVM, sun on Tron, lamports on Solana).
+        usdAmount:
+          type: [string, "null"]
+          description: |
+            USD value of the tier amount via the price oracle. Null when the
+            oracle is unavailable for the chain's native symbol — the fee is
+            still quoted in native; USD display degrades gracefully.
+
+    PayoutBatchInput:
+      type: object
+      required: [payouts]
+      properties:
+        payouts:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/PlanPayoutInput"
+      description: |
+        Up to 100 `PlanPayoutInput` rows. Each row is validated and inserted
+        independently — per-row errors do NOT abort the batch. The request
+        consumes N tokens from the merchant's `merchantPerMinute` quota
+        (proportional rate limit, not a single-request charge).
+
+    PayoutBatchResponse:
+      type: object
+      required: [batchId, results, summary]
+      properties:
+        batchId:
+          type: string
+          description: |
+            UUID shared across every successfully-planned row in the batch.
+            Filter list responses with `GET /payouts?batchId=<id>`.
+        results:
+          type: array
+          items:
+            oneOf:
+              - type: object
+                required: [index, status, payout]
+                properties:
+                  index: { type: integer }
+                  status: { type: string, enum: [planned] }
+                  payout: { $ref: "#/components/schemas/Payout" }
+              - type: object
+                required: [index, status, error]
+                properties:
+                  index: { type: integer }
+                  status: { type: string, enum: [failed] }
+                  error:
+                    type: object
+                    properties:
+                      code: { type: string }
+                      message: { type: string }
+        summary:
+          type: object
+          required: [planned, failed]
+          properties:
+            planned: { type: integer }
+            failed: { type: integer }
+
+    BalanceSnapshot:
+      type: object
+      required: [generatedAt, source, totalUsd, families]
+      properties:
+        generatedAt: { type: string, format: date-time }
+        source:
+          type: string
+          enum: [db, rpc]
+          description: |
+            Where the numbers came from. `db` = derived from recorded
+            transactions/payouts (fast default). `rpc` = live chain
+            snapshot (opts-in via `?live=true`).
+        totalUsd:
+          type: string
+          description: Grand total USD across every family in the snapshot, fixed to 2 decimal places.
+        families:
+          type: array
+          items: { $ref: "#/components/schemas/FamilyBalance" }
+
+    FamilyBalance:
+      type: object
+      required: [family, totalUsd, chains]
+      properties:
+        family: { type: string, enum: [evm, tron, solana] }
+        totalUsd: { type: string }
+        chains:
+          type: array
+          items: { $ref: "#/components/schemas/ChainBalance" }
+
+    ChainBalance:
+      type: object
+      required: [chainId, totalUsd, tokens, addresses, errors]
+      properties:
+        chainId: { type: integer }
+        totalUsd: { type: string }
+        tokens:
+          type: array
+          description: Per-token roll-up across every address on this chain.
+          items:
+            type: object
+            required: [token, amountRaw, amountDecimal, usd]
+            properties:
+              token: { type: string }
+              amountRaw: { type: string, description: Sum of raw token amounts (smallest units). }
+              amountDecimal: { type: string }
+              usd: { type: string }
+        addresses:
+          type: array
+          items: { $ref: "#/components/schemas/AddressBalance" }
+        errors:
+          type: integer
+          description: |
+            Number of addresses on this chain we tried to snapshot but couldn't
+            (RPC error, missing adapter). Non-zero means the totals are partial
+            and shouldn't be read as authoritative.
+
+    AddressBalance:
+      type: object
+      required: [address, kind, totalUsd, tokens]
+      description: |
+        Every gateway-controlled HD address. The legacy "fee" kind has been
+        removed — `address_pool` is now the single source of payout-source
+        addresses, and the picker treats every pool row as a candidate.
+      properties:
+        address: { type: string }
+        kind: { type: string, enum: [pool] }
+        poolStatus:
+          type: string
+          enum: [available, allocated, quarantined]
+        poolAllocatedToInvoiceId:
+          type: [string, "null"]
+          description: Invoice this address is currently allocated to (when `poolStatus=allocated`).
+        totalUsd: { type: string }
+        tokens:
+          type: array
+          items: { $ref: "#/components/schemas/TokenBalance" }
+
+    TokenBalance:
+      type: object
+      required: [token, decimals, amountRaw, amountDecimal, usd, usdRate]
+      properties:
+        token: { type: string }
+        decimals: { type: integer }
+        amountRaw:
+          type: string
+          description: Raw integer string in the token's smallest units.
+        amountDecimal:
+          type: string
+          description: Human-readable decimal form (UI convenience).
+        usd:
+          type: string
+          description: USD value of this balance. `"0.00"` when the token isn't priced (oracle miss); check `usdRate` to distinguish.
+        usdRate:
+          type: [string, "null"]
+          description: USD-per-token rate at snapshot time. `null` when the price oracle had no entry.
+
+    Payout:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        kind:
+          type: string
+          enum: [standard, gas_top_up]
+          description: |
+            `standard` = merchant-facing payout. `gas_top_up` = internal
+            sibling row inserted when the source needed JIT gas top-up;
+            references the parent via `parentPayoutId`. Merchant-facing
+            list endpoints filter to `standard` by default.
+        parentPayoutId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Set on `gas_top_up` rows to the standard payout that triggered
+            the top-up. Always null on standard rows.
+        status:
+          type: string
+          enum: [planned, reserved, topping-up, submitted, confirmed, failed, canceled]
+          description: |
+            `topping-up` indicates the source lacked native gas and the
+            executor is waiting for the sponsor → source top-up tx
+            (`topUpTxHash`) to confirm before broadcasting the main payout.
+        chainId: { type: integer }
+        token: { type: string }
+        amountRaw: { type: string }
+        quotedAmountUsd:
+          type: [string, "null"]
+          description: |
+            Original USD-pegged input from the create request. Populated only
+            when the create used `amountUSD`; null for `amountRaw` / `amount` paths.
+        quotedRate:
+          type: [string, "null"]
+          description: |
+            Price-oracle rate (USD per 1 whole token) snapshotted at create time.
+            Populated only when the create used `amountUSD`. For non-stable
+            tokens the broadcast may happen later — this is the create-time
+            rate, not the executed-time rate.
+        feeTier:
+          type: [string, "null"]
+          enum: [low, medium, high, null]
+          description: |
+            Fee tier bound at create time (echo of the `feeTier` input). Null
+            when the create didn't specify one. EVM binds this into
+            `maxFeePerGas` / `maxPriorityFeePerGas` at broadcast; Solana
+            binds a matching `setComputeUnitPrice`; Tron ignores.
+        feeQuotedNative:
+          type: [string, "null"]
+          description: |
+            Native-unit fee cost quoted at plan time for the chosen `feeTier`,
+            captured from `quoteFeeTiers().{tier}.nativeAmountRaw`. Lets
+            operators compare quoted vs. actual (post-confirm) for drift
+            analysis. Null when no tier was requested.
+        batchId:
+          type: [string, "null"]
+          description: |
+            Grouping id for mass-payout batches. Same UUID across every row
+            of a `POST /payouts/batch` call; null for single-create payouts.
+        destinationAddress: { type: string }
+        sourceAddress:
+          type: [string, "null"]
+          description: |
+            HD address that funded the payout. Picked by `selectSource`
+            from `address_pool` (richest token holder first). Null while
+            the payout is still in `planned`.
+        txHash: { type: [string, "null"] }
+        topUpTxHash:
+          type: [string, "null"]
+          description: |
+            Hash of the sponsor → source gas top-up tx, when one was
+            needed. Stays set after the main tx confirms — the parent row
+            carries both hashes for audit. Null when no top-up was required.
+        topUpSponsorAddress:
+          type: [string, "null"]
+          description: |
+            HD address that sent the top-up. The actual ledger debit is
+            captured by the sibling `gas_top_up` payout row referenced via
+            `parentPayoutId` lookups.
+        feeEstimateNative: { type: [string, "null"] }
+        lastError: { type: [string, "null"] }
+        webhookUrl:
+          type: [string, "null"]
+          format: uri
+          description: |
+            Per-payout webhook URL override (echo-only). Null when the payout
+            falls back to the merchant-account webhook. The matching secret
+            is write-only and never returned.
+        createdAt: { type: string, format: date-time }
+        submittedAt: { type: [string, "null"], format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+        broadcastAttemptedAt:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            Set by the broadcast-slot CAS the first time the executor tried
+            to broadcast. Distinguishes "never attempted" (still planned /
+            reserved, cron hasn't picked it up) from "attempted at least
+            once" (crashed mid-broadcast → stuck reservation candidate for
+            the sweeper). Handy for operator triage of stuck payouts.
+        updatedAt: { type: string, format: date-time }

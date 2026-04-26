@@ -1,0 +1,1804 @@
+{
+  "info": {
+    "name": "crypto-gateway",
+    "description": "Complete flow coverage for crypto-gateway: admin bootstrap, merchant API (invoices + payouts), public checkout, provider webhook ingest, and internal cron.\n\n## Quick start\n1. Import this collection AND `crypto-gateway.local.postman_environment.json` (Environments tab).\n2. Select the `crypto-gateway (local)` environment.\n3. Fill in `adminKey` in the environment. Other values are auto-populated by test scripts as you run requests.\n4. Run `_Setup` → `1. Health` to confirm connectivity.\n5. Run `_Setup` → `2. Create merchant` — its test script saves `apiKey`, `merchantId`, `webhookSecret` into the environment for subsequent merchant API calls.\n6. Use the per-chain quick-starts under `Invoices / Quick starts` to create sample invoices on each supported chain.\n\n## Chaining\nTest scripts write `merchantId`, `merchantApiKey`, `webhookSecret`, `invoiceId`, `invoiceReceiveAddress`, `payoutId`, and per-chain `alchemySigningKey_<chainId>` into the environment so later requests can consume them without copy-paste.\n\n## Webhook simulation\nThe `Webhooks (simulate)` folder fires synthetic Alchemy payloads at `/webhooks/alchemy`. The pre-request script computes the correct HMAC using `alchemySigningKey` from the environment, so after bootstrap + signing-key save, the ingest route accepts them as if from Alchemy.\n\n## Server-side config (not used by Postman — reference only)\nThese env vars affect the gateway's behavior but aren't exercised by any request in this collection. Documented here so operators testing against a deployed gateway know what knobs exist.\n\n**Price oracle fallback chain.** Invoice quoting walks a chained list of providers. Each link tries itself first; on error/timeout/unmapped symbol it delegates. Only the terminal `static-peg` link serves hardcoded values. Default ordering with `ALCHEMY_API_KEY` set: `CoinGecko → Alchemy → CoinCap → Binance → static-peg`.\n- `PRICE_ADAPTER` — `coingecko` (default), `alchemy` (Alchemy-first), or `static-peg` (skip all live sources)\n- `COINGECKO_API_KEY`, `COINGECKO_PLAN=demo|pro`, `COINCAP_API_KEY` — optional, raise the per-provider rate budget\n- `DISABLE_COINGECKO=1`, `DISABLE_COINCAP=1`, `DISABLE_BINANCE=1`, `DISABLE_ALCHEMY=1` — drop individual providers from the chain\n\n**Log shipping + alerting.**\n- `ALERT_WEBHOOK_URL` — `error`/`fatal` logs are POSTed here as JSON. Sliding-window rate-limited to 30/min, with `droppedSinceLast` reported on the next delivery\n- `ALERT_WEBHOOK_AUTH_HEADER` — value for the `Authorization` header (e.g. `Bearer xyz`)\n\nSee the repository README for the full env-var table.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "crypto-gateway-v2"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Fresh, collision-resistant externalId per request so Runner loops",
+          "// don't hit unique-externalId constraints.",
+          "pm.variables.set('runExternalId', `run-${Date.now()}-${Math.floor(Math.random()*1e6)}`);"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Collection-level sanity: a 5xx is always a bug worth flagging.",
+          "pm.test('No 5xx server error', () => pm.expect(pm.response.code).to.be.below(500));"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "_Setup",
+      "description": "Bootstrap flow. Run top-to-bottom in Collection Runner to get a working merchant + API key + (optionally) Alchemy webhook registration.",
+      "item": [
+        {
+          "name": "1. Health",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('reports status=ok', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2. Create merchant",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/admin/merchants", "host": ["{{baseUrl}}"], "path": ["admin", "merchants"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Postman Test Merchant\",\n  \"webhookUrl\": \"https://merchant.example.com/crypto-gateway/webhook\",\n  \"paymentToleranceUnderBps\": 0,\n  \"paymentToleranceOverBps\": 0,\n  \"addressCooldownSeconds\": 0\n}"
+            },
+            "description": "Creates a merchant and returns the plaintext `apiKey` (saved into env) + plaintext `webhookSecret` (saved into env). Neither is recoverable afterward — Postman stores them in the environment so downstream requests chain automatically.\n\n`paymentToleranceUnderBps` / `paymentToleranceOverBps` set the merchant's default invoice payment tolerance in basis points (1 bp = 0.01 %; capped at 2000). `0 / 0` is strict — every cent must match. Per-invoice overrides on `POST /api/v1/invoices` win when set. Tweak via `PATCH /admin/merchants/:id` later.\n\n`addressCooldownSeconds` parks a just-released pool address for N seconds so late payments can still credit the original invoice. `0` (default) preserves legacy immediate-reuse. Capped at 7 days (604800s)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "if (body.merchant && body.merchant.id) {",
+                  "  pm.environment.set('merchantId', body.merchant.id);",
+                  "  console.log('saved merchantId =', body.merchant.id);",
+                  "}",
+                  "if (body.apiKey) {",
+                  "  pm.environment.set('merchantApiKey', body.apiKey);",
+                  "  console.log('saved merchantApiKey (length ' + body.apiKey.length + ')');",
+                  "}",
+                  "if (body.webhookSecret) {",
+                  "  pm.environment.set('webhookSecret', body.webhookSecret);",
+                  "  console.log('saved webhookSecret (length ' + body.webhookSecret.length + ')');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2b. Update merchant (name, webhook URL, tolerances, cooldown)",
+          "request": {
+            "method": "PATCH",
+            "url": { "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}", "host": ["{{baseUrl}}"], "path": ["admin", "merchants", "{{merchantId}}"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Postman Test Merchant (renamed)\",\n  \"paymentToleranceUnderBps\": 50,\n  \"paymentToleranceOverBps\": 100,\n  \"addressCooldownSeconds\": 300\n}"
+            },
+            "description": "Mutates any combination of `name`, `webhookUrl`, `paymentToleranceUnderBps`, `paymentToleranceOverBps`, `addressCooldownSeconds`. All optional; body must contain ≥1 field.\n\n- `name`: display label, free-form up to 128 chars.\n- `webhookUrl`: outbound receiver. SSRF-guarded (private / loopback / metadata hosts rejected). **First-time set** — if the merchant was created without a URL, this PATCH mints a fresh HMAC secret and returns the plaintext once in `webhookSecret` (same contract as create). **Changing an existing URL** does NOT rotate the secret; the signed-HMAC contract stays stable. To rotate the secret itself, use `2h. Rotate webhook secret`.\n- `paymentToleranceUnderBps`: paid USD within `bps` of target closes as `confirmed` instead of `partial`. 50 = 0.5 %.\n- `paymentToleranceOverBps`: paid USD within `bps` over target closes as `confirmed` instead of `overpaid`. 100 = 1 %.\n- `addressCooldownSeconds`: parks a released pool address for N seconds so late payments still credit the original invoice. 300 = 5 min; 0 disables. Capped at 7 days (604800s).\n\nTolerance / cooldown changes apply to invoices created / releases that happen **after** this PATCH; already-stamped cooldown deadlines and existing invoice tolerance snapshots are unaffected."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('echoes new tolerances', () => {",
+                  "  pm.expect(body.merchant.paymentToleranceUnderBps).to.equal(50);",
+                  "  pm.expect(body.merchant.paymentToleranceOverBps).to.equal(100);",
+                  "  pm.expect(body.merchant.addressCooldownSeconds).to.equal(300);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2c. List merchants",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants?limit=50&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants"],
+              "query": [
+                { "key": "limit", "value": "50" },
+                { "key": "offset", "value": "0" },
+                { "key": "active", "value": "true", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Paginated list of merchants, newest first. Never leaks `api_key_hash` or `webhook_secret_ciphertext`. Enable the `active` query param to scope to live (`true`) or deactivated (`false`) rows."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns merchants array', () => pm.expect(body.merchants).to.be.an('array'));",
+                  "pm.test('no secret fields leaked', () => {",
+                  "  const s = JSON.stringify(body);",
+                  "  pm.expect(s).to.not.match(/apiKeyHash|webhookSecret|ciphertext/i);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2d. Get merchant by id",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}", "host": ["{{baseUrl}}"], "path": ["admin", "merchants", "{{merchantId}}"] },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Fetch a single merchant by id. Returns the same shape as the list endpoint (minus pagination wrapper). 404 when unknown."
+          }
+        },
+        {
+          "name": "2e. Rotate merchant API key",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}/rotate-key",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants", "{{merchantId}}", "rotate-key"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Issues a fresh plaintext API key. The prior key is rejected on the next request. Use this if the old key has leaked — OR if it was lost at create time (`POST /admin/merchants` only returns the plaintext once). The test script overwrites `merchantApiKey` in the environment so downstream requests automatically chain to the new key.\n\nWebhook URL/secret are intentionally NOT rotated here — changing them mid-flight orphans pending outbox rows signed under the old key."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns new plaintext apiKey', () => {",
+                  "  pm.expect(body.apiKey).to.match(/^sk_[0-9a-f]{64}$/);",
+                  "});",
+                  "if (body.apiKey) {",
+                  "  pm.environment.set('merchantApiKey', body.apiKey);",
+                  "  console.log('rotated merchantApiKey');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2f. Deactivate merchant",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}/deactivate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants", "{{merchantId}}", "deactivate"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Sets `active=false`. Inbound requests using the merchant's API key start returning 401 immediately. Idempotent. Does NOT invalidate the stored key hash — reactivation with `2g. Reactivate merchant` restores the same credential. If the key has been compromised, rotate (`2e`) first."
+          }
+        },
+        {
+          "name": "2g. Reactivate merchant",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}/activate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants", "{{merchantId}}", "activate"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Sets `active=true`. Idempotent."
+          }
+        },
+        {
+          "name": "2h. Rotate webhook secret",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}/rotate-webhook-secret",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants", "{{merchantId}}", "rotate-webhook-secret"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Issues a fresh plaintext HMAC signing secret. Required when the old secret has leaked (or the merchant lost it — `POST /admin/merchants` only returns the plaintext once). The test script overwrites `webhookSecret` in the environment.\n\n**Coordinated rotation required.** Outbox rows dispatched AFTER this call — including any queued before the rotation — will be signed with the NEW secret. The merchant's verifier must hold the new value when those deliveries arrive, or they'll 401 and land in `webhook_deliveries.status='dead'`. Sequence: announce → rotate here → hand the new plaintext to the merchant → they update their verifier. Any dead rows can be replayed via `/admin/webhook-deliveries/:id/replay` once the merchant confirms.\n\n400 if the merchant has no `webhookUrl` — use `2b. Update merchant` to set the URL first (first-time set mints a fresh secret automatically)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns new plaintext webhookSecret', () => {",
+                  "  pm.expect(body.webhookSecret).to.match(/^[0-9a-f]{64}$/);",
+                  "});",
+                  "if (body.webhookSecret) {",
+                  "  pm.environment.set('webhookSecret', body.webhookSecret);",
+                  "  console.log('rotated webhookSecret');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3a. Initialize address pool",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/pool/initialize",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "pool", "initialize"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"families\": [\"evm\", \"tron\", \"solana\"],\n  \"initialSize\": 5\n}"
+            },
+            "description": "Seeds the address pool. Creates N HD-derived addresses per family (evm/tron/solana), marks them 'available', fires `pool.address.created` events that the Alchemy subscription tracker fans out to per-chain webhook registrations.\n\nIdempotent: re-running tops up families below target size. Families whose chain adapter isn't wired on the gateway are reported as `skipped-no-adapter`.\n\nSubsequent invoice creations allocate from this pool. When the available count drops below the refill threshold, a background refill fires automatically — but the initial seed is explicit so operators see the pool filling up before traffic arrives."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('results per family', () => pm.expect(body.results).to.be.an('array'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3b. Pool stats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/pool/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "pool", "stats"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Per-family pool snapshot: available / allocated / quarantined / total + highest address_index. Watch this with an alert on available-count under threshold to catch low-supply before POOL_EXHAUSTED fires on a live invoice-create."
+          }
+        },
+        {
+          "name": "3c. Pool derivation audit (GET /admin/pool/audit)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/pool/audit",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "pool", "audit"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Walks the address_pool and for each row derives the EXPECTED address from the current MASTER_SEED at that row's address_index. Compares to the stored address. Any mismatch means the gateway can't sign for that address — the row was either populated with a different seed or by some external tool.\n\nRun this:\n- Before funding a fresh pool with real money.\n- After deploying where MASTER_SEED might have changed.\n- When a payout reports 'Signer-address mismatch' — identify all broken rows in one call.\n\nResponse `status` is 'healthy' or 'mismatches-detected'. Scans up to 500 rows per family per call; large pools can paginate by fixing and re-running."
+          }
+        },
+        {
+          "name": "3. Inspect HD payout sources (admin balance snapshot)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?kind=pool",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "kind", "value": "pool", "description": "Only `pool` exists today; the legacy `fee` value is silently coerced." },
+                { "key": "family", "value": "evm", "disabled": true },
+                { "key": "chainId", "value": "42161", "disabled": true },
+                { "key": "live", "value": "true", "disabled": true, "description": "Force RPC reconciliation. Slow (15-30s); off by default." }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "There is no separate fee-wallet table any more — every HD-derived address in `address_pool` is a candidate payout source. Use this endpoint to see ledger-derived spendable balances per chain/address (confirmed inbound − confirmed outbound − active reservations). The `selectSource` picker reads the same data when planning payouts, so what you see here is exactly what the picker will see.\n\nFor a quick \"can this chain fund a payout right now?\" check, the per-chain `tokens` rollup is the fastest signal."
+          }
+        },
+        {
+          "name": "4a. Fee wallets — list configuration (GET /admin/fee-wallets)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/admin/fee-wallets", "host": ["{{baseUrl}}"], "path": ["admin", "fee-wallets"] },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Returns one row per family (evm, tron, solana) with its adapter capability + current configuration (or null).\n\nCapability values:\n- `none`     — EVM today (no native feePayer separation). Fee wallet can be registered, but the planner won't use it.\n- `delegate` — Tron. Fee wallet stakes TRX and DelegateResources energy to pool addresses.\n- `co-sign`  — Solana. Fee wallet signs every payout as the tx's feePayer, covering sig fee + ATA rent."
+          }
+        },
+        {
+          "name": "4b. Fee wallet — pick existing HD pool address (POST .../use-pool)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/{{family}}/use-pool",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "{{family}}", "use-pool"],
+              "variable": [{ "key": "family", "value": "solana" }]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"address\": \"<base58 / hex address from address_pool>\"\n}"
+            },
+            "description": "Registers an existing HD pool address as the family's fee wallet. Zero new secrets — the address is already derivable from MASTER_SEED at its recorded `address_index`, same path pool payouts use.\n\nThe server verifies the address actually exists in `address_pool` for the family before writing. Returns 404 POOL_ADDRESS_NOT_FOUND if not.\n\nSwap by DELETE then POST again. Path variable `family` must be `evm` | `tron` | `solana`."
+          }
+        },
+        {
+          "name": "4c. Fee wallet — import external private key (POST .../import)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/{{family}}/import",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "{{family}}", "import"],
+              "variable": [{ "key": "family", "value": "tron" }]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"privateKey\": \"<hex, with or without 0x prefix>\",\n  \"address\": \"<canonical form for this family>\"\n}"
+            },
+            "description": "Use when you have an external wallet (common for Tron operators who don't want to re-stake 14 days' cooldown on a fresh address).\n\nPrivate key is encrypted at the boundary via secretsCipher (AES-256-GCM — same primitive used for webhook HMAC secrets). Plaintext is only in-memory for the encrypt call, never logged or stored.\n\nCross-checked at import: the declared `address` must equal the private key's derived address (via ChainAdapter.addressFromPrivateKey). Mismatch → 400 ADDRESS_KEY_MISMATCH, no row persisted. Key parse failure → 400 INVALID_PRIVATE_KEY. Both caught before storage, so you can't silently persist a mismatched key."
+          }
+        },
+        {
+          "name": "4d. Fee wallet — remove (DELETE /admin/fee-wallets/{family})",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/{{family}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "{{family}}"],
+              "variable": [{ "key": "family", "value": "solana" }]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Idempotent. Planner immediately falls back to self-pay on next plan.\n\nIMPORTANT (Tron): removing the registration does NOT unfreeze staked TRX or reverse active delegations. For Tron, always call /undelegate on each active delegation and /unfreeze on staked TRX BEFORE removing, or funds stay locked on-chain."
+          }
+        },
+        {
+          "name": "4e. Tron — fee wallet resource status (GET .../tron/resources)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/resources",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "resources"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Energy + bandwidth snapshot for the Tron fee wallet (via /wallet/getaccountresource). Operators poll this after freeze/delegate to verify the setup.\n\n`energyAvailable` includes both the wallet's own stake AND resources delegated IN — it's what the chain actually lets the account consume today before TRX burn kicks in. `bandwidthAvailable` includes Tron's ~600/day free allowance."
+          }
+        },
+        {
+          "name": "4f. Tron — stake TRX for resources (POST .../tron/freeze)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/freeze",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "freeze"]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"balance\": 100000000,\n  \"resource\": \"ENERGY\"\n}"
+            },
+            "description": "Wraps /wallet/freezebalancev2. `balance` is in sun — 100_000_000 = 100 TRX. `resource` is ENERGY (for TRC-20 execution) or BANDWIDTH (for tx bytes).\n\nStaked TRX is reclaimable via /unfreeze (14-day cooldown). Not a burn.\n\nSigned with the fee wallet's key via signerStore and broadcast through the same path production payouts use."
+          }
+        },
+        {
+          "name": "4g. Tron — delegate resources to a pool address (POST .../tron/delegate)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/delegate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "delegate"]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"receiver\": \"<pool address (base58)>\",\n  \"balance\": 50000000,\n  \"resource\": \"ENERGY\",\n  \"lock\": false\n}"
+            },
+            "description": "Wraps /wallet/delegateresource. `balance` is STAKE in sun (not energy amount) — the delegated stake produces a network-variable energy-per-day rate, see /tron/resources to tune.\n\nResponse includes `receiverIsInPool`: true when the receiver address is an `address_pool` row (typical), false when delegating to an external address (allowed but warned).\n\nScript this across every pool address you want to free from TRX-burn payouts."
+          }
+        },
+        {
+          "name": "4h. Tron — reclaim delegation (POST .../tron/undelegate)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/undelegate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "undelegate"]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"receiver\": \"<pool address (base58)>\",\n  \"balance\": 50000000,\n  \"resource\": \"ENERGY\"\n}"
+            },
+            "description": "Reverses a prior /delegate. Reclaimed stake rejoins the fee wallet's free pool (not immediately withdrawable — it's still staked, just no longer lent out).\n\nMust be called BEFORE /unfreeze on any delegated stake: Tron rejects an unfreeze that would leave active delegations unfunded."
+          }
+        },
+        {
+          "name": "4i. Tron — begin unstake cooldown (POST .../tron/unfreeze)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/unfreeze",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "unfreeze"]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"balance\": 100000000,\n  \"resource\": \"ENERGY\"\n}"
+            },
+            "description": "Begins the 14-day unlock period on staked TRX. Funds become withdrawable after that (separate withdrawexpireunfreeze call). Used when rebalancing or decommissioning a fee wallet."
+          }
+        },
+        {
+          "name": "0. Discover chains (wired vs registry-only, with token list)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/chains",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "chains"],
+              "query": [
+                { "key": "family", "value": "evm", "description": "evm | tron | solana", "disabled": true },
+                { "key": "wired", "value": "true", "description": "true = only adapters loaded into deps.chains; false = registry-only", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Discovery endpoint for the dashboard's bootstrap picker. Returns every chain in the static `CHAIN_REGISTRY` (minus the synthetic dev chain `999`) along with three readiness booleans per chain so the dashboard can decide bootstrap state in a single call:\n\n- `wired`             — a `ChainAdapter` for the chainId is loaded in `deps.chains`\n- `webhooksSupported` — chain *can* use Alchemy webhooks (EVM + Solana). **False for Tron** — RPC-poll only, no webhook concept. Frontend should hide the 'register webhook' CTA when this is false.\n- `alchemyConfigured` — operator's `ALCHEMY_CHAINS` env actually includes this chainId.\n- `webhooks`          — row exists in `alchemy_webhook_registry`. Only meaningful when `webhooksSupported=true`.\n- `feeWallets`        — kept for API stability; now reflects \"the chain's family has at least one HD address available as a payout source\".\n- `detection`         — `alchemy` | `rpc-poll`. Derived from `webhooksSupported`.\n- `bootstrapReady`    — `wired && (!webhooksSupported || webhooks) && feeWallets`. Tron can be ready with just `wired+feeWallets`.\n\nAlso returns the static token list per chain and the confirmation threshold the gateway will apply. The dev chain (chainId 999) is excluded — it's a test-harness chain, never bootstrap real Alchemy webhooks against it.\n\nNever returns secrets (signing keys, seeds, env)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('chains array with shape', () => {",
+                  "  pm.expect(body).to.have.property('chains');",
+                  "  pm.expect(body.chains).to.be.an('array');",
+                  "  if (body.chains.length > 0) {",
+                  "    pm.expect(body.chains[0]).to.include.keys(['chainId','slug','family','wired','webhooksSupported','alchemyConfigured','webhooks','feeWallets','detection','bootstrapReady','tokens']);",
+                  "  }",
+                  "});",
+                  "pm.test('dev chain (999) is hidden', () => {",
+                  "  pm.expect(body.chains.find(c => c.chainId === 999)).to.equal(undefined);",
+                  "});",
+                  "pm.test('no secrets leaked', () => {",
+                  "  pm.expect(pm.response.text()).to.not.match(/whsec_|signing|MASTER_SEED|privateKey/);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4a. List Alchemy webhook registrations (one per chain)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/alchemy-webhooks?limit=100&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "alchemy-webhooks"],
+              "query": [
+                { "key": "limit", "value": "100", "description": "1..500, default 100" },
+                { "key": "offset", "value": "0" },
+                { "key": "chainId", "value": "", "description": "Narrow to one chain id.", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Read-only view of `alchemy_webhook_registry`. Use this from the dashboard to decide which chains are already wired (skip bootstrap) versus which still need it. The signing key is **never** returned — it stays encrypted at rest. To verify or rotate a key, use `POST /admin/alchemy-webhooks/signing-keys`.\n\nResponse:\n```json\n{\n  \"webhooks\": [\n    { \"chainId\": 1, \"chain\": \"ethereum\", \"webhookId\": \"wh_...\", \"webhookUrl\": \"https://...\", \"createdAt\": \"...\", \"updatedAt\": \"...\" }\n  ],\n  \"limit\": 100,\n  \"offset\": 0,\n  \"hasMore\": false\n}\n```"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('paginated response, no signing key leaked', () => {",
+                  "  pm.expect(body).to.have.property('webhooks');",
+                  "  pm.expect(JSON.stringify(body)).to.not.include('whsec_');",
+                  "  pm.expect(JSON.stringify(body)).to.not.include('signing');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4b. Manually register a signing key (dashboard-created webhook)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/alchemy-webhooks/signing-keys",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "alchemy-webhooks", "signing-keys"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 1,\n  \"webhookId\": \"wh_paste_from_alchemy_dashboard\",\n  \"signingKey\": \"whsec_paste_from_create_response\",\n  \"webhookUrl\": \"https://gateway.example.com/webhooks/alchemy\"\n}"
+            },
+            "description": "Only needed when you created a webhook directly in the Alchemy dashboard UI (skipping bootstrap) OR when a bootstrap run returned `persisted: false` on a `created` row. Encrypts the signingKey via `SECRETS_ENCRYPTION_KEY` and upserts into `alchemy_webhook_registry`. Re-running with the same `chainId` rotates (dashboard delete+recreate workflow).\n\nMost operators should NOT need this — bootstrap persists signing keys automatically."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('registered object echoes chainId + webhookId', () => {",
+                  "  pm.expect(body.registered).to.have.property('chainId');",
+                  "  pm.expect(body.registered).to.have.property('webhookId');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4. Bootstrap Alchemy webhooks",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/bootstrap/alchemy-webhooks",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "bootstrap", "alchemy-webhooks"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainIds\": [1, 10, 137, 8453, 42161, 43114, 56, 900]\n}"
+            },
+            "description": "Idempotently creates one ADDRESS_ACTIVITY webhook per chain on Alchemy, pointing at `$GATEWAY_PUBLIC_URL/webhooks/alchemy`. The webhook URL is NOT accepted in the body — it's built from the `GATEWAY_PUBLIC_URL` env var on the gateway (security: prevents a leaked ADMIN_KEY from redirecting Alchemy's traffic).\n\nPer-chain signing keys are persisted encrypted in `alchemy_webhook_registry`. The test script also saves the first `created` key into `alchemySigningKey` so the webhook simulator can HMAC-sign payloads.\n\n**Gateway env requirements:**\n- `ALCHEMY_NOTIFY_TOKEN` — **the webhook management token**, not the JSON-RPC API key. Get it from the top of https://dashboard.alchemy.com/apps/latest/webhooks (labelled 'Auth Token'). Using `ALCHEMY_API_KEY` here returns `401 AuthError` from Alchemy. (Old name `ALCHEMY_AUTH_TOKEN` still accepted with a deprecation warning.)\n- `GATEWAY_PUBLIC_URL` — public origin of this gateway (e.g. `https://your-worker.workers.dev`).\n- `ADMIN_KEY` — set on the gateway AND in this Postman environment."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "const results = body.results || [];",
+                  "for (const r of results) {",
+                  "  if (r.status === 'created' && r.signingKey) {",
+                  "    // Per-chain env var so a multi-chain bootstrap doesn't collapse keys.",
+                  "    pm.environment.set(`alchemySigningKey_${r.chainId}`, r.signingKey);",
+                  "    // Also populate the generic `alchemySigningKey` with the first created key",
+                  "    // so single-chain flows + the webhook simulator have a default.",
+                  "    if (!pm.environment.get('alchemySigningKey')) {",
+                  "      pm.environment.set('alchemySigningKey', r.signingKey);",
+                  "    }",
+                  "    console.log(`saved alchemySigningKey_${r.chainId}`);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Invoices",
+      "description": "Merchant-scoped invoice API. Requires `merchantApiKey` (auto-populated by `_Setup / 2. Create merchant`).",
+      "item": [
+        {
+          "name": "Create invoice (parametric)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"externalId\": \"{{runExternalId}}\",\n  \"expiresInMinutes\": 30\n}"
+            },
+            "description": "Uses `chainId`, `token`, `amountRaw` from the environment. Flip chains by changing the environment values; or use one of the `Quick starts` requests that pre-set them.\n\nAlternative shape: omit `amountRaw` and provide `fiatAmount` + `fiatCurrency` to let the gateway quote the crypto amount against the price oracle.\n\n**Idempotency.** `externalId` is your dedup key (Stripe-style). A retry of the same `(merchantId, externalId)` returns the original invoice — same body, same `receiveAddress` — instead of allocating a new pool address. Safe to send the same POST twice after a network blip. The default body uses a fresh `runExternalId` per request so Collection Runner loops don't collide; pin `externalId` to a constant value to exercise the idempotent-replay path explicitly.\n\nOptional per-invoice webhook override: pass `webhookUrl` + `webhookSecret` together to route this invoice's events to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned. Dispatch precedence: invoice override → merchant default → skip. See `Create invoice (with per-invoice webhook)` for an example."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "if (body.invoice && body.invoice.id) {",
+                  "  pm.environment.set('invoiceId', body.invoice.id);",
+                  "  pm.environment.set('invoiceReceiveAddress', body.invoice.receiveAddress);",
+                  "  console.log('saved invoiceId =', body.invoice.id);",
+                  "  console.log('receiveAddress =', body.invoice.receiveAddress);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create invoice (with per-invoice webhook)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"externalId\": \"{{runExternalId}}-perinv\",\n  \"webhookUrl\": \"https://merchant.example.com/per-invoice/hook\",\n  \"webhookSecret\": \"replace-with-min-16-char-shared-secret\"\n}"
+            },
+            "description": "Same as the parametric Create invoice, but sets a per-invoice `webhookUrl` + `webhookSecret`. Events for THIS invoice (`invoice.detected`, `invoice.confirmed`, etc.) dispatch to the per-invoice URL signed with the per-invoice secret instead of the merchant-account default. Response echoes `webhookUrl`; `webhookSecret` is never returned."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('echoes webhookUrl', () => pm.expect(body.invoice.webhookUrl).to.eql('https://merchant.example.com/per-invoice/hook'));",
+                  "pm.test('does not echo webhookSecret', () => pm.expect(body.invoice).to.not.have.property('webhookSecret'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create invoice (with payment tolerance override)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountUsd\": \"2.00\",\n  \"acceptedFamilies\": [\"evm\"],\n  \"externalId\": \"{{runExternalId}}-tol\",\n  \"paymentToleranceUnderBps\": 50,\n  \"paymentToleranceOverBps\": 100\n}"
+            },
+            "description": "Per-invoice payment tolerance override. `paymentToleranceUnderBps: 50` (0.5 %) means a 1.99 USD payment against a 2.00 USD invoice closes as `confirmed` instead of `partial`. `paymentToleranceOverBps: 100` (1 %) means a 2.02 USD payment closes as `confirmed` instead of `overpaid`. Each is capped at 2000 bps (20 %); omit either to inherit the merchant default. Snapshotted at create time — a later `PATCH /admin/merchants/:id` does not retroactively reshape this invoice."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('echoes tolerance fields', () => {",
+                  "  pm.expect(body.invoice.paymentToleranceUnderBps).to.equal(50);",
+                  "  pm.expect(body.invoice.paymentToleranceOverBps).to.equal(100);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List invoices (paginated, filters)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/invoices?limit=25&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "invoices"],
+              "query": [
+                { "key": "limit", "value": "25", "description": "1..100, default 25" },
+                { "key": "offset", "value": "0", "description": "Page offset." },
+                { "key": "status", "value": "", "description": "Comma-separated: created,partial,detected,confirmed,overpaid,expired,canceled", "disabled": true },
+                { "key": "chainId", "value": "", "description": "Narrow to one chain id.", "disabled": true },
+                { "key": "token", "value": "", "description": "Narrow to one token symbol (e.g. USDC).", "disabled": true },
+                { "key": "externalId", "value": "", "description": "Exact-match on merchant-supplied dedup key.", "disabled": true },
+                { "key": "toAddress", "value": "", "description": "Invoice receive address (canonicalized).", "disabled": true },
+                { "key": "fromAddress", "value": "", "description": "Payer address. Matches invoices that have any detected/confirmed tx from this address.", "disabled": true },
+                { "key": "createdFrom", "value": "", "description": "Inclusive lower bound on createdAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "createdTo", "value": "", "description": "Inclusive upper bound on createdAt (ISO-8601 or unix ms).", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "Paginated list of the authenticated merchant's invoices, newest first. `merchantId` is always taken from the API key — no way to list another merchant's invoices. Response shape:\n\n```json\n{\n  \"invoices\": [ { ... } ],\n  \"limit\": 25,\n  \"offset\": 0,\n  \"hasMore\": false\n}\n```\n\nPage via `limit` + `offset`; `hasMore` is computed without a COUNT(*) so the list path stays cheap."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('paginated response', () => {",
+                  "  pm.expect(body).to.have.property('invoices');",
+                  "  pm.expect(body.invoices).to.be.an('array');",
+                  "  pm.expect(body).to.have.property('hasMore');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get invoice (with USD breakdown + transactions)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/invoices/{{invoiceId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "invoices", "{{invoiceId}}"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "Returns:\n\n```json\n{\n  \"invoice\": { ... },\n  \"amounts\": {\n    \"requiredUsd\": \"100.00\",\n    \"confirmedUsd\": \"60.00\",\n    \"confirmingUsd\": \"25.00\",\n    \"remainingUsd\": \"40.00\",\n    \"overpaidUsd\": \"0.00\"\n  },\n  \"transactions\": [\n    { \"chain\": \"ethereum\", \"chainId\": 1, \"token\": \"USDC\", \"amount\": \"60\", \"amountUsd\": \"60.00\", \"status\": \"confirmed\", \"txHash\": \"0x...\", \"fromAddress\": \"0x...\", \"toAddress\": \"0x...\", \"detectedAt\": \"...\", \"confirmedAt\": \"...\" },\n    { \"chain\": \"polygon\", \"chainId\": 137, \"token\": \"USDC\", \"amount\": \"25\", \"amountUsd\": \"25.00\", \"status\": \"detected\", ... }\n  ]\n}\n```\n\n- `amounts.*` is null for legacy single-token invoices (use `requiredAmountRaw` / `receivedAmountRaw` on the invoice itself there).\n- `transactions` includes ALL statuses: `detected` / `confirmed` / `reverted` / `orphaned` — handy for debugging when received/paid look stuck."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('has amounts + transactions blocks', () => {",
+                  "  pm.expect(body).to.have.property('amounts');",
+                  "  pm.expect(body).to.have.property('transactions');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Expire invoice",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/invoices/{{invoiceId}}/expire",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "invoices", "{{invoiceId}}", "expire"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "Transitions the invoice to `expired`. Idempotent-ish: already-terminal invoices return 200 with their current state. Frees the HD-derived receive address for reuse lifecycle-wise (Alchemy address-subscription sweep will deregister it)."
+          }
+        },
+        {
+          "name": "Quick starts",
+          "description": "Pre-filled `Create invoice` variants — one per supported chain × stablecoin. Each overrides its own `chainId`/`token`/`amountRaw` via request-scoped variables so you don't have to edit the environment to try a different chain. Each saves `invoiceId` + `invoiceReceiveAddress` on success.",
+          "item": [
+            {
+              "name": "ETH mainnet — USDC (1 USDC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Polygon — USDT (1 USDT)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 137,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Arbitrum — USDC (1 USDC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 42161,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Base — USDC (1 USDC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 8453,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "OP mainnet — USDC (1 USDC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 10,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Avalanche — USDC (1 USDC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 43114,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "BSC — USDT (1 USDT, 18-decimal!)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 56,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000000000000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "BSC USDT is **18 decimals** (Binance-Peg BEP-20, not the 6-decimal native tokens on other chains). 1 USDT = 10^18 raw. Don't hardcode 6 anywhere."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Tron — USDT (1 USDT)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 728126428,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Requires `TRONGRID_API_KEY` on the gateway for incoming-transfer detection. Payouts work with Alchemy alone; detection does not."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Solana — USDC SPL (1 USDC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 900,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "SPL USDC on Solana mainnet. Receive-only today — detection via Alchemy ADDRESS_ACTIVITY webhook (parses `event.transaction[].meta.post_token_balances`). SPL payouts are deferred."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Dev chain — DEV (1 DEV)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 999,\n  \"token\": \"DEV\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Local-only test chain. Payouts work against a synthetic broadcast shim — perfect for integration testing without touching a real network."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Multi-family — USDT accepted on EVM + Tron + Solana",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"acceptedFamilies\": [\"evm\", \"tron\", \"solana\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Multi-family acceptance (A1.b). Invoice is allocated one pool address PER family; payer picks which chain to pay on and the gateway detects wherever it lands.\n\nResponse includes `receiveAddresses: [{family, address}, ...]` — render all three at checkout. `chainId` + `receiveAddress` echo the primary family (first in the list) for legacy clients.\n\nRequires the pool to be seeded for every family in `acceptedFamilies` (see `_Setup > 3a. Initialize address pool`). Missing chain adapters → `TOKEN_NOT_SUPPORTED`."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Multi-family — USDT accepted on EVM + Tron only",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"acceptedFamilies\": [\"evm\", \"tron\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Subset of families. Two receive addresses returned — payer can pay USDT on any of the 7 EVM chains OR on Tron mainnet. Same invoice satisfies whichever chain gets the payment first."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Universal USD invoice ($25, all families, any token)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDC\",\n  \"amountUsd\": \"25.00\",\n  \"acceptedFamilies\": [\"evm\", \"tron\", \"solana\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "USD-pegged invoice payable from ANY supported chain in ANY registered token — including native gas tokens. Difference vs. `Multi-family — USDT`:\n\n- `amountUsd` instead of `amountRaw` — invoice tracks the $25 target across whichever token/chain pays.\n- **Universal token acceptance.** Stable + native are equally first-class. Pay with USDC on Arbitrum, ETH on Ethereum, USDT on Tron, TRX on Tron, POL on Polygon, AVAX on Avalanche, BNB on BSC, SOL on Solana — even mix them: $15 USDC + $10 ETH satisfies a $25 invoice. Each transfer's USD value is computed at detection time via the pinned rate snapshot and summed.\n- Rates are pinned at creation for 10 minutes (the rate window).\n- `chainId` + `token` are the *primary* family (used for the legacy `receiveAddress`). Real acceptance is everything in `acceptedFamilies`.\n\nResponse contains `acceptedFamilies`, `receiveAddresses[]`, `amountUsd`, `paidUsd`, `rates`, and `rateWindowExpiresAt`. Follow up with `Get invoice` to see the live USD breakdown + per-tx detail (including any reverted/detected rows).\n\nThe checkout page (`GET /checkout/:id`) renders one row per (chain, token) combination via the `payableTokens` field — pre-computed minimum amounts ready to pay."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Fiat-quoted invoice (USD → USDC, amount inferred)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDC\",\n  \"fiatAmount\": \"49.99\",\n  \"fiatCurrency\": \"USD\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Alternative invoice-creation shape: instead of `amountRaw`, pass `fiatAmount` + `fiatCurrency`. The gateway quotes the token amount via `deps.priceOracle` (default = static USD peg for stablecoins) and persists the quoted rate on the invoice."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Payouts",
+      "description": "Merchant-scoped payout API. Requires at least one funded HD-derived address (visible via `_Setup / 3. Inspect HD payout sources`). The picker automatically falls back to JIT gas top-up when the source has the token but lacks native — no fee-wallet pre-registration needed.",
+      "item": [
+        {
+          "name": "Plan payout (parametric)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"destinationAddress\": \"{{destinationAddress}}\"\n}"
+            },
+            "description": "Creates a `planned` payout. The `executeReservedPayouts` cron job picks an HD source by ledger balance (richest token-holder first), writes reservation rows, and broadcasts. If the chosen source lacks native for gas, the executor first broadcasts a sponsor → source top-up tx (parent transitions through `topping-up`), waits for it to confirm, then broadcasts the main payout. Polls `getConfirmationStatus` each tick until finalized.\n\n**Token symbol** can be any registered on the chain — stablecoins (USDC/USDT) **and** native gas (ETH/POL/BNB/AVAX/TRX/SOL). Natives are first-class. Discover valid symbols per chain via `GET /admin/chains`.\n\n**Amount input (pick exactly one):**\n- `amountRaw` — uint256 string in token's smallest unit (e.g. `\"1000000\"` = 1 USDC, `\"1000000000000000000\"` = 1 ETH)\n- `amount` — human decimal string (e.g. `\"1.5\"`); converted via BigInt against `token.decimals`. Too many decimal places → 400 `BAD_AMOUNT`.\n- `amountUSD` — fiat-pegged decimal (e.g. `\"10.00\"`); converted via the price oracle at create time. Oracle outage → 503 `ORACLE_FAILED`.\n\nOptional per-payout webhook override: pass `webhookUrl` + `webhookSecret` together to route this payout's events (`payout.submitted`, `payout.confirmed`, `payout.failed`) to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "if (body.payout && body.payout.id) {",
+                  "  pm.environment.set('payoutId', body.payout.id);",
+                  "  console.log('saved payoutId =', body.payout.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Plan payout — dev chain (auto-destination)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"chainId\": 999,\n  \"token\": \"DEV\",\n  \"amountRaw\": \"500000\",\n  \"destinationAddress\": \"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n}" }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.payout && body.payout.id) { pm.environment.set('payoutId', body.payout.id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Plan native payout — Arbitrum ETH (decimal amount)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 42161,\n  \"token\": \"ETH\",\n  \"amount\": \"0.05\",\n  \"destinationAddress\": \"0x16214769e25a97256419aeea44b35b4a72ddc4c1\"\n}"
+            },
+            "description": "Sends 0.05 ETH on Arbitrum from an HD-derived source. Native gas tokens (ETH/POL/BNB/AVAX/TRX/SOL) are first-class — pass the native symbol as `token`. At least one HD address in the pool must hold enough ETH on Arbitrum (check via `GET /admin/balances?chainId=42161`). Native payouts can't use the gas-top-up fallback (gas IS the asset); if no source has `amount + gas` headroom, the call returns `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` with `details.suggestedAmountRaw` for the dashboard to retry against."
+          }
+        },
+        {
+          "name": "Plan native payout — Tron TRX (USD-pegged)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 728126428,\n  \"token\": \"TRX\",\n  \"amountUSD\": \"5.00\",\n  \"destinationAddress\": \"TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7\"\n}"
+            },
+            "description": "Sends $5 worth of native TRX on Tron mainnet. The price oracle resolves TRX/USD at create time; the resolved rate is snapshotted on the row as `quotedRate` (e.g. `\"0.25\"` for $0.25 per TRX → ~20 TRX). Note: TRX is volatile, so the actual broadcast value may drift slightly from $5 by the time the cron picks it up. Oracle outage → 503 `ORACLE_FAILED`."
+          }
+        },
+        {
+          "name": "Plan payout (with per-payout webhook)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"destinationAddress\": \"{{destinationAddress}}\",\n  \"webhookUrl\": \"https://merchant.example.com/per-payout/hook\",\n  \"webhookSecret\": \"replace-with-min-16-char-shared-secret\"\n}"
+            },
+            "description": "Same as the parametric Plan payout, but sets a per-payout `webhookUrl` + `webhookSecret`. Events for THIS payout dispatch to the per-payout URL signed with the per-payout secret instead of the merchant-account default. Response echoes `webhookUrl`; `webhookSecret` is never returned."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('echoes webhookUrl', () => pm.expect(body.payout.webhookUrl).to.eql('https://merchant.example.com/per-payout/hook'));",
+                  "pm.test('does not echo webhookSecret', () => pm.expect(body.payout).to.not.have.property('webhookSecret'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List payouts (paginated, filters)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payouts?limit=25&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payouts"],
+              "query": [
+                { "key": "limit", "value": "25", "description": "1..100, default 25" },
+                { "key": "offset", "value": "0", "description": "Page offset." },
+                { "key": "status", "value": "", "description": "Comma-separated: planned,reserved,submitted,confirmed,failed,canceled", "disabled": true },
+                { "key": "chainId", "value": "", "description": "Narrow to one chain id.", "disabled": true },
+                { "key": "token", "value": "", "description": "Narrow to one token symbol (e.g. USDC).", "disabled": true },
+                { "key": "destinationAddress", "value": "", "description": "Exact match on the canonicalized destination.", "disabled": true },
+                { "key": "sourceAddress", "value": "", "description": "Fee wallet that funded the payout — implicitly excludes `planned` rows.", "disabled": true },
+                { "key": "createdFrom", "value": "", "description": "Inclusive lower bound on createdAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "createdTo", "value": "", "description": "Inclusive upper bound on createdAt (ISO-8601 or unix ms).", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "Paginated list of the authenticated merchant's payouts, newest first. Response shape:\n\n```json\n{\n  \"payouts\": [ { ... } ],\n  \"limit\": 25,\n  \"offset\": 0,\n  \"hasMore\": false\n}\n```"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('paginated response', () => {",
+                  "  pm.expect(body).to.have.property('payouts');",
+                  "  pm.expect(body.payouts).to.be.an('array');",
+                  "  pm.expect(body).to.have.property('hasMore');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get payout",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payouts/{{payoutId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payouts", "{{payoutId}}"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }]
+          }
+        },
+        {
+          "name": "Cancel payout (reserved only)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payouts/{{payoutId}}/cancel",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payouts", "{{payoutId}}", "cancel"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "Cancel a payout still in `reserved` status. Releases the source + (when present) sponsor reservations so the ledger balance frees up immediately for the next plan.\n\nOnce a broadcast has started (`topping-up`, `submitted`, or terminal states) the gateway can't recall the on-chain tx; this returns **409 PAYOUT_NOT_CANCELABLE**.\n\nIdempotent on already-canceled rows — a re-cancel returns the existing canceled row with 200. Cross-merchant access returns 404 (not 403) to avoid leaking payout ids.\n\nNo `payout.canceled` webhook event is emitted today; inspect the 200 response body or poll `GET /payouts/:id`."
+          }
+        },
+        {
+          "name": "Estimate fees (tiers)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts/estimate", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts", "estimate"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 42161,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"destinationAddress\": \"0x16214769e25a97256419aeea44b35b4a72ddc4c1\"\n}"
+            },
+            "description": "Quotes low/medium/high fee tiers for a hypothetical payout WITHOUT planning anything. Call this before `Plan payout` to show the operator cost options; they then pick a tier on the real POST via the `feeTier` field.\n\n**EVM**: priority-fee multipliers on `estimateFeesPerGas` (0.8× / 1.0× / 1.5×). `tieringSupported: true` except on legacy non-EIP-1559 chains.\n**Solana**: 25th / 50th / 75th percentile of recent `getRecentPrioritizationFees` samples; falls back to conservative defaults when samples are empty.\n**Tron**: single tier (no priority concept); `tieringSupported: false`."
+          }
+        },
+        {
+          "name": "Mass payouts (batch up to 100)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts/batch", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts", "batch"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payouts\": [\n    { \"chainId\": 42161, \"token\": \"USDC\", \"amount\": \"1.5\", \"destinationAddress\": \"0x1111111111111111111111111111111111111111\" },\n    { \"chainId\": 42161, \"token\": \"USDC\", \"amount\": \"2.0\", \"destinationAddress\": \"0x2222222222222222222222222222222222222222\" },\n    { \"chainId\": 1, \"token\": \"ETH\", \"amount\": \"0.01\", \"destinationAddress\": \"0x3333333333333333333333333333333333333333\" }\n  ]\n}"
+            },
+            "description": "Mass-create up to 100 payouts in one call. Per-row errors do NOT abort the batch — partial success is normal. Every planned row carries the same `batchId` (top-level in response) so you can `GET /api/v1/payouts?batchId=<uuid>` to list them.\n\n**Rate limit:** costs N tokens from the merchant's per-minute quota (not 1). A 100-row batch against a 60-per-minute merchant will 429 on the 61st row; cap batches to what your quota can afford.\n\n**HTTP 200** on partial success. Inspect `results[i].status` + `.error` / `.payout` per row. `400` only when the whole array fails schema (oversize, missing `payouts`, etc.)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "if (body.batchId) { pm.environment.set('batchId', body.batchId); console.log('saved batchId =', body.batchId); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List payouts — filter by batchId",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payouts?batchId={{batchId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payouts"],
+              "query": [{ "key": "batchId", "value": "{{batchId}}" }]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "List every payout belonging to a specific batch (uses `batchId` saved by the `Mass payouts` request). Useful for reconciliation after a partial-success batch."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Checkout (public)",
+      "description": "Unauthenticated checkout view — the URL your frontend or Telegram bot renders for the payer.",
+      "item": [
+        {
+          "name": "Get checkout view",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/checkout/{{invoiceId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["checkout", "{{invoiceId}}"]
+            },
+            "description": "Returns the invoice in a payer-safe shape: receive address, required amount, expiry, status. `merchantId`, `metadata`, `externalId` are intentionally NOT exposed to the public path."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Webhooks (simulate provider)",
+      "description": "Fake Alchemy webhook payloads sent through the real ingest route, signed with the HMAC key saved by `_Setup / 4. Bootstrap Alchemy webhooks` (or set manually via `alchemySigningKey` in the environment).\n\nThe pre-request script computes `HMAC-SHA256(body, signingKey)` hex and puts it in `X-Alchemy-Signature` — same flow the real Alchemy service uses.",
+      "item": [
+        {
+          "name": "Alchemy EVM — incoming USDC (Ethereum)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/webhooks/alchemy", "host": ["{{baseUrl}}"], "path": ["webhooks", "alchemy"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Alchemy-Signature", "value": "", "description": "Populated by pre-request script" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"webhookId\": \"wh_sim_evm\",\n  \"id\": \"whevt_sim_evm\",\n  \"createdAt\": \"2026-04-16T12:00:00Z\",\n  \"type\": \"ADDRESS_ACTIVITY\",\n  \"event\": {\n    \"network\": \"ETH_MAINNET\",\n    \"activity\": [\n      {\n        \"fromAddress\": \"0x1111111111111111111111111111111111111111\",\n        \"toAddress\": \"{{invoiceReceiveAddress}}\",\n        \"blockNum\": \"0x1234567\",\n        \"hash\": \"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\",\n        \"category\": \"token\",\n        \"rawContract\": {\n          \"rawValue\": \"0xF4240\",\n          \"address\": \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\",\n          \"decimals\": 6\n        },\n        \"log\": { \"logIndex\": \"0x2\" }\n      }\n    ]\n  }\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Sign the raw body with the Alchemy signing key and put the hex HMAC into X-Alchemy-Signature.",
+                  "const body = pm.request.body.raw;",
+                  "const key = pm.environment.get('alchemySigningKey_1') || pm.environment.get('alchemySigningKey');",
+                  "if (!key) { throw new Error('alchemySigningKey not set — run `_Setup / 4. Bootstrap Alchemy webhooks` or set it manually in the environment'); }",
+                  "const sig = CryptoJS.HmacSHA256(body, key).toString(CryptoJS.enc.Hex);",
+                  "pm.request.headers.upsert({ key: 'X-Alchemy-Signature', value: sig });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Alchemy Solana — incoming USDC SPL",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/webhooks/alchemy", "host": ["{{baseUrl}}"], "path": ["webhooks", "alchemy"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Alchemy-Signature", "value": "", "description": "Populated by pre-request script" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"webhookId\": \"wh_sim_sol\",\n  \"id\": \"whevt_sim_sol\",\n  \"createdAt\": \"2026-04-16T12:00:00Z\",\n  \"type\": \"ADDRESS_ACTIVITY\",\n  \"event\": {\n    \"network\": \"SOLANA_MAINNET\",\n    \"slot\": 290000000,\n    \"transaction\": [\n      {\n        \"signature\": \"5simTxSolanaUSDC\",\n        \"slot\": 290000000,\n        \"transaction\": [{ \"signatures\": [\"5simTxSolanaUSDC\"], \"message\": [{ \"account_keys\": [] }] }],\n        \"meta\": [{\n          \"err\": null,\n          \"fee\": 5000,\n          \"pre_token_balances\": [\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"{{invoiceReceiveAddress}}\", \"ui_token_amount\": { \"amount\": \"0\", \"decimals\": 6 } },\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"5auZoWJxJodSU8dwgKmAfmphv5Z9Su3HAzEdLz1EUZs7\", \"ui_token_amount\": { \"amount\": \"5000000\", \"decimals\": 6 } }\n          ],\n          \"post_token_balances\": [\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"{{invoiceReceiveAddress}}\", \"ui_token_amount\": { \"amount\": \"1000000\", \"decimals\": 6 } },\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"5auZoWJxJodSU8dwgKmAfmphv5Z9Su3HAzEdLz1EUZs7\", \"ui_token_amount\": { \"amount\": \"4000000\", \"decimals\": 6 } }\n          ]\n        }]\n      }\n    ]\n  }\n}"
+            },
+            "description": "Simulates an incoming USDC SPL transfer (1.000000 USDC) to the Solana receive address saved by the most recent 'Create invoice' against Solana. Payload shape matches Alchemy's protobuf-JSON serialization (1-element arrays for `transaction` / `message` / `meta`)."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.request.body.raw;",
+                  "const key = pm.environment.get('alchemySigningKey_900') || pm.environment.get('alchemySigningKey');",
+                  "if (!key) { throw new Error('alchemySigningKey[_900] not set — run `_Setup / 4. Bootstrap Alchemy webhooks` with chainIds including 900, or set `alchemySigningKey_900` manually'); }",
+                  "const sig = CryptoJS.HmacSHA256(body, key).toString(CryptoJS.enc.Hex);",
+                  "pm.request.headers.upsert({ key: 'X-Alchemy-Signature', value: sig });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Admin / Webhook deliveries",
+      "description": "Operator-only dead-letter queue for outbound webhook deliveries. Use these when a merchant webhook has been failing and you've coordinated a fix.\n\n### Outbound event types (the `eventType` column)\n\n**Invoice lifecycle** (one row per status transition, idempotency key `{event}:{invoiceId}:{status}`):\n- `invoice.partial`, `invoice.detected`, `invoice.confirmed`, `invoice.overpaid`, `invoice.expired`, `invoice.canceled`\n- `invoice.demoted` — reorg un-confirmation; key includes `{previousStatus}:{newStatus}`\n\n**Per-transfer audit** (one row per on-chain tx per stage; key `{event}:{invoiceId}:{txHash}` so detect→confirm produces TWO distinct rows for the same tx):\n- `invoice.transfer_detected` — first sighting of a pending transfer (push or poll). `data.payment.confirmations` is `0` for push-detected, `n` for poll-detected.\n- `invoice.payment_received` — same transfer reached the confirmation threshold.\n\n**Payout lifecycle**: `payout.submitted`, `payout.confirmed`, `payout.failed`\n\nURL/secret resolution: per-resource override → merchant default → silently skipped (with a `warn` log so misconfig is visible). Body is HMAC-SHA256 signed in `X-Webhook-Signature`; merchants should de-dup on `X-Webhook-Idempotency-Key`.",
+      "item": [
+        {
+          "name": "List dead deliveries",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/webhook-deliveries?status=dead&limit=50&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "webhook-deliveries"],
+              "query": [
+                { "key": "status", "value": "dead", "description": "pending | delivered | dead" },
+                { "key": "limit", "value": "50" },
+                { "key": "offset", "value": "0" }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Returns a page of webhook delivery rows filtered by status. Default `status=dead` surfaces rows that exhausted the retry schedule (5 outer attempts × up to 4 inline HTTP attempts each) and require operator intervention before the merchant sees the event."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('has deliveries array', () => pm.expect(body.deliveries).to.be.an('array'));",
+                  "const first = (body.deliveries || [])[0];",
+                  "if (first && first.id) {",
+                  "  pm.environment.set('deadDeliveryId', first.id);",
+                  "  console.log('saved deadDeliveryId =', first.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Replay a dead delivery",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/webhook-deliveries/{{deadDeliveryId}}/replay",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "webhook-deliveries", "{{deadDeliveryId}}", "replay"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Resets a row from `dead` to `pending` with `next_attempt_at = now`, so the next scheduled-jobs sweep re-dispatches it. Returns 404 with code `NOT_DEAD` if the row is not in dead status — pending rows are already queued and delivered rows don't need replay.\n\nSet `deadDeliveryId` from the List-dead-deliveries test script, or paste a specific id."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('replayed echoes id', () => pm.expect(body.replayed).to.have.property('id'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Admin / Orphans & Audit",
+      "description": "Reconciliation surface for transfers that couldn't be auto-attributed. Orphans are on-chain transfers on addresses with no active invoice and no active cooldown — ingest writes them with `invoice_id=NULL`, `status='orphaned'`, and NO merchant-facing webhooks fire. Operators either attribute them to a specific invoice (normal or terminal — the `viaAdminOverride` path lets expired/canceled invoices flip to `confirmed`/`overpaid` when the credit clears the bar) or dismiss them with a reason. Audit-address closes the loop for 'merchant says they never got X': it re-scans on-chain history for an address and ingests anything missing.",
+      "item": [
+        {
+          "name": "List open orphans",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/orphan-transactions?limit=50&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "orphan-transactions"],
+              "query": [
+                { "key": "chainId", "value": "", "disabled": true, "description": "Optional: narrow to one chain" },
+                { "key": "limit", "value": "50" },
+                { "key": "offset", "value": "0" }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Returns open orphans (invoice_id IS NULL AND dismissed_at IS NULL), ordered by `detectedAt DESC`. Backed by a partial index so the queue stays cheap regardless of total tx volume."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('orphans array', () => pm.expect(body.orphans).to.be.an('array'));",
+                  "const first = (body.orphans || [])[0];",
+                  "if (first && first.id) {",
+                  "  pm.environment.set('orphanTxId', first.id);",
+                  "  console.log('saved orphanTxId =', first.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Attribute orphan to an invoice",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/orphan-transactions/{{orphanTxId}}/attribute",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "orphan-transactions", "{{orphanTxId}}", "attribute"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"{{invoiceId}}\"\n}"
+            },
+            "description": "Re-points the orphan's `invoice_id` at `invoiceId`, promotes the tx from `orphaned` to `detected`/`confirmed` based on its confirmation count, and runs `recomputeInvoiceFromTransactions` with `viaAdminOverride=true`.\n\nThe override lets an `expired` / `canceled` invoice flip to `confirmed` (or `overpaid` on USD-path) when the attributed credit clears the confirm bar. Partial credits against a terminal invoice stay parked — the merchant's decision stands if the payment doesn't cover the invoice.\n\nReturns 404 if the orphan/invoice is unknown, 409 if the tx is already attributed or dismissed."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('attribution echoes ids + statuses', () => {",
+                  "  pm.expect(body.attribution).to.have.property('txId');",
+                  "  pm.expect(body.attribution).to.have.property('invoiceStatusBefore');",
+                  "  pm.expect(body.attribution).to.have.property('invoiceStatusAfter');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Dismiss orphan",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/orphan-transactions/{{orphanTxId}}/dismiss",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "orphan-transactions", "{{orphanTxId}}", "dismiss"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"customer refunded out-of-band, see ticket #123\"\n}"
+            },
+            "description": "Stamps `dismissed_at` + `dismiss_reason`. The tx row stays in the `transactions` table for audit, but the partial index drops it from the open-orphans queue.\n\n409 if the tx is attributed to an invoice (not an orphan) or already dismissed."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('dismissal echoes reason', () => pm.expect(body.dismissal).to.have.property('reason'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Audit an address",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/audit-address",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "audit-address"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 1,\n  \"address\": \"0x0000000000000000000000000000000000000000\",\n  \"sinceMs\": 0\n}"
+            },
+            "description": "Re-runs the chain adapter's `scanIncoming` for every registered token on `chainId` (plus the native symbol), diffs against `transactions`, and ingests missing rows through the normal ingest path (so orphan / cooldown / invoice-match rules apply identically).\n\nUse when a merchant reports a missing payment. Idempotent — already-stored txs are silently skipped via the UNIQUE `(chain_id, tx_hash, log_index)` constraint.\n\n`sinceMs` defaults to `now - 30 days` if omitted; the adapter's own max-scan window further clamps the range."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('audit echoes counts', () => {",
+                  "  pm.expect(body.audit).to.have.property('scanned');",
+                  "  pm.expect(body.audit).to.have.property('inserted');",
+                  "  pm.expect(body.audit).to.have.property('alreadyPresent');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Admin / Balances",
+      "description": "Operator-only treasury view. Returns per-address + per-chain + per-family token balances with USD totals, shaped token → address → chain → family → grand total. The top-level `source` field tells you which math produced the numbers.\n\n**Mode `source=\"db\"` (default, fast)**\n- Spendable per (chainId, address) = SUM(confirmed `transactions.amountRaw` inbound) − SUM(confirmed `payouts.amountRaw` outbound from this address) − SUM(active `payout_reservations.amountRaw` for this address), clamped at 0.\n- No RPC traffic; ~50ms regardless of pool size.\n- Addresses with no recorded activity are omitted.\n- Caveat: off-system movements are invisible (rare on chains with Alchemy webhooks). Use `?live=true` for reconciliation.\n\n**Mode `source=\"rpc\"` (opts-in via `?live=true`)**\n- Fans out one `getAccountBalances` call per (address, chainId) pair across every wired adapter. Authoritative but 15–30s cold.\n- Use for post-topup audit. Not for dashboard auto-refresh.\n\n**Caching**: keyed by mode + query string. DB mode TTL = 5s; RPC mode TTL = 60s. `db` and `rpc` entries do not share a slot. Each response carries `cached: true|false`.",
+      "item": [
+        {
+          "name": "Snapshot — DB-derived (default, fast)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Default mode: balances derived from the `transactions` + `payouts` tables — no RPC traffic. ~50ms. Response `snapshot.source === \"db\"`. Addresses with no recorded activity are omitted. Use this for dashboards."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('source is db by default', () => {",
+                  "  pm.expect(body.snapshot.source).to.equal('db');",
+                  "});",
+                  "pm.test('has snapshot.families + cached flag', () => {",
+                  "  pm.expect(body).to.have.property('cached');",
+                  "  pm.expect(body.snapshot).to.have.property('families');",
+                  "  pm.expect(body.snapshot).to.have.property('totalUsd');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Snapshot — live RPC reconciliation (?live=true)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?live=true",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "live", "value": "true", "description": "Forces a live on-chain snapshot. Expensive — 15–30s typical for a full mainnet pool." }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Opts into the authoritative RPC path: fans out one `getAccountBalances` call per (address, chainId) pair to every wired chain adapter. Response `snapshot.source === \"rpc\"`. Use for post-topup reconciliation or audit — never bind to dashboard auto-refresh. Cached 60s."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('source is rpc', () => {",
+                  "  pm.expect(body.snapshot.source).to.equal('rpc');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Snapshot — narrow by family (evm)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?family=evm",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "family", "value": "evm", "description": "evm | tron | solana" }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Restricts the sweep to one family. Cheaper than the full snapshot when you only want EVM treasury. Cached separately from the unfiltered call."
+          }
+        },
+        {
+          "name": "Snapshot — narrow by chainId (Ethereum mainnet)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?chainId=1",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [{ "key": "chainId", "value": "1" }]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Single-chain snapshot. Use when investigating a specific chain (e.g. after funding an HD pool address on it)."
+          }
+        },
+        {
+          "name": "Snapshot — payout source candidates (richest first)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?kind=pool",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "kind", "value": "pool", "description": "Only `pool` exists today; the legacy `fee` value is silently coerced." }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Every HD-derived pool address with its ledger-derived spendable balances. The payout picker reads exactly this data when planning — what you see here matches what the picker will pick."
+          }
+        },
+        {
+          "name": "Snapshot — single address spot-check",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?address={{invoiceReceiveAddress}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "address", "value": "{{invoiceReceiveAddress}}", "description": "Any address known to the gateway (pool or fee). Uses the receive address from the most recent invoice by default." }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Skips the rest of the universe and only snapshots one address. Cheapest possible call — handy when an operator wants to verify a specific wallet without paying the full sweep cost."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin / Migrate",
+      "description": "Operator-only schema migration trigger. Most production runtimes (Workers, Vercel Edge) have no filesystem at runtime and return 501 here — use `wrangler d1 migrations apply` or the Turso CLI for those. Local Node + remote libSQL/Postgres deployments can call this directly.",
+      "item": [
+        {
+          "name": "Apply pending migrations",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/migrate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "migrate"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Runs the bundled migration set through the idempotent runner. Already-applied IDs are skipped. Returns `{ applied: [...], skipped: [...] }`. On runtimes without filesystem access (Workers / Vercel Edge) returns 501 with code `MIGRATIONS_NOT_BUNDLED`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 or 501 (runtime-dependent)', () => {",
+                  "  pm.expect([200, 501]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Internal",
+      "description": "Endpoints the gateway operator hits directly — not the merchant surface, not public.",
+      "item": [
+        {
+          "name": "Cron tick",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/internal/cron/tick",
+              "host": ["{{baseUrl}}"],
+              "path": ["internal", "cron", "tick"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{cronSecret}}" }],
+            "description": "Runs the full scheduled-jobs sequence out of band: `pollPayments → confirmTransactions → executeReservedPayouts → confirmPayouts → sweepStuckPayoutReservations (→ alchemySyncAddresses)`.\n\nOutside Cloudflare Workers / Deno Deploy (which have native cron), this is the only way to advance state between invoices. Vercel Cron hits this on a schedule; for local Node runs it's handy to invoke manually after creating an invoice and simulating a webhook.\n\nReturns `{ ok: true, result: { <perJobOutcome> } }`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

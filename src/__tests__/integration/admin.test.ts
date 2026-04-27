@@ -1,9 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 
 const ADMIN_KEY = "super-secret-admin-key";
-const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
 
 describe("POST /admin/merchants", () => {
   let booted: BootedTestApp;

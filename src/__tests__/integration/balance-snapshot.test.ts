@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { addressPool, merchants, payouts, transactions } from "../../db/schema.js";
+import { addressPool, transactions } from "../../db/schema.js";
 import { computeBalanceSnapshot } from "../../core/domain/balance-snapshot.service.js";
 import { initializePool } from "../../core/domain/pool.service.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";

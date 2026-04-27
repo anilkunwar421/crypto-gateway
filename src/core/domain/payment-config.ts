@@ -13,6 +13,8 @@ export const DEFAULT_CONFIRMATION_THRESHOLDS: Readonly<Record<number, number>> =
   11155111: 3, // Sepolia testnet
   800: 6,      // Bitcoin mainnet (~60 min at 10-min blocks)
   801: 12,     // Litecoin mainnet (~30 min at 2.5-min blocks)
+  802: 1,      // Bitcoin testnet3 — 1 confirmation (test environment)
+  803: 1,      // Litecoin testnet — 1 confirmation
   999: 1       // dev chain
 };
 

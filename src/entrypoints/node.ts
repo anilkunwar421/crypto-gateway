@@ -22,7 +22,11 @@ import {
   bitcoinChainAdapter,
   litecoinChainAdapter
 } from "../adapters/chains/utxo/utxo-chain.adapter.js";
-import { BITCOIN_CONFIG, LITECOIN_CONFIG } from "../adapters/chains/utxo/utxo-config.js";
+import {
+  BITCOIN_CONFIG,
+  LITECOIN_CONFIG,
+  utxoConfigForChainId
+} from "../adapters/chains/utxo/utxo-config.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
@@ -34,6 +38,10 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
+import { dbBlockcypherSubscriptionStore } from "../adapters/detection/blockcypher-subscription-store.js";
+import { makeBlockcypherSyncSweep } from "../adapters/detection/blockcypher-sync-sweep.js";
+import { blockcypherNotifyDetection } from "../adapters/detection/blockcypher-notify.adapter.js";
+import { loadBlockcypherChainConfigs } from "../adapters/detection/blockcypher-config.js";
 import { merchants } from "../db/schema.js";
 import { loadConfig, ConfigValidationError } from "../config/config.schema.js";
 import type { ChainAdapter } from "../core/ports/chain.port.js";
@@ -218,6 +226,55 @@ async function main(): Promise<void> {
     alchemy = { syncAddresses: sweep };
   }
 
+  // BlockCypher push-detection accelerator. Per-chain config: each UTXO
+  // chain registered in `chains` reads its own
+  //   BLOCKCYPHER_TOKEN_<SLUG> + BLOCKCYPHER_CALLBACK_URL_<SLUG>
+  // env-var pair (e.g. BLOCKCYPHER_TOKEN_BITCOIN, _LITECOIN, _BITCOIN_TESTNET).
+  // A chain is BlockCypher-enabled iff BOTH vars are set non-empty for it.
+  // Setting only one is a hard boot error (the operator clearly intended to
+  // turn it on but only set half). Chains BlockCypher doesn't cover (e.g.
+  // LTC testnet, blockcypherCoinPath=null) are skipped silently.
+  let blockcypher: AppDeps["blockcypher"];
+  let blockcypherPushStrategy: ReturnType<typeof blockcypherNotifyDetection> | undefined;
+  const blockcypherConfigs = loadBlockcypherChainConfigs({ secrets, chains, logger });
+  if (blockcypherConfigs.size > 0) {
+    const sweep = makeBlockcypherSyncSweep({
+      store: dbBlockcypherSubscriptionStore(db),
+      configByChainId: blockcypherConfigs,
+      logger,
+      clock: { now: () => new Date() }
+    });
+    blockcypher = {
+      syncSubscriptions: sweep,
+      configuredChainIds: new Set(blockcypherConfigs.keys())
+    };
+    // The notify strategy is a thin wrapper around projectBlockcypherTx.
+    // It needs to know "what addresses do we own on this chainId" — we
+    // compute the set fresh per push by querying invoices.receive_address
+    // for utxo-family invoices. (Most paths are sub-millisecond DB reads;
+    // BlockCypher's worst-case fan-out is one push per active invoice.)
+    blockcypherPushStrategy = blockcypherNotifyDetection(
+      async (innerDeps, chainId) => {
+        const { invoices } = await import("../db/schema.js");
+        const { eq } = await import("drizzle-orm");
+        const rows = await innerDeps.db
+          .select({ address: invoices.receiveAddress })
+          .from(invoices)
+          .where(eq(invoices.chainId, chainId));
+        const set = new Set<string>();
+        for (const r of rows) set.add(r.address.toLowerCase());
+        const cfg = utxoConfigForChainId(chainId);
+        const native = cfg?.nativeSymbol ?? "BTC";
+        return { chainId, nativeSymbol: native as "BTC" | "LTC", ourAddresses: set };
+      }
+    );
+    const enabledSlugs = Array.from(blockcypherConfigs.values()).map((c) => c.slug);
+    logger.info("BlockCypher accelerator wired (per-chain)", {
+      chains: enabledSlugs,
+      chainCount: blockcypherConfigs.size
+    });
+  }
+
   const clock = { now: () => new Date() };
   const feeWalletStore = dbFeeWalletStore({ db, secretsCipher, clock });
   const deps: AppDeps = {
@@ -272,9 +329,19 @@ async function main(): Promise<void> {
     // — it's inert without incoming webhook POSTs, and this way operators only
     // have to run the admin bootstrap (or manual signing-key register) to
     // enable /webhooks/alchemy end-to-end without touching this file.
-    pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
+    pushStrategies: {
+      "alchemy-notify": alchemyNotifyDetection(),
+      // BlockCypher strategy is registered conditionally — present only when
+      // the deployment's env vars are set. The /webhooks/blockcypher route
+      // returns 404 NOT_CONFIGURED when this key is absent, so a misrouted
+      // BlockCypher webhook never reaches an inert handler.
+      ...(blockcypherPushStrategy !== undefined
+        ? { "blockcypher-notify": blockcypherPushStrategy }
+        : {})
+    },
     clock,
     ...(alchemy !== undefined ? { alchemy } : {}),
+    ...(blockcypher !== undefined ? { blockcypher } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     migrationsFolder,
     confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),

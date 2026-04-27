@@ -995,6 +995,34 @@
               "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
+              "name": "Bitcoin testnet — BTC (0.0001 BTC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 802,\n  \"token\": \"BTC\",\n  \"amountRaw\": \"10000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Bitcoin testnet3 (chainId 802). BIP84 m/84'/1'/0'/0/N → tb1q… addresses. coin_type=1 per slip-0044 (shared testnet). Esplora at mempool.space/testnet + blockstream.info/testnet. 1-confirmation finality. BlockCypher push detection available via btc/test3 path."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Litecoin testnet — LTC (0.001 LTC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 803,\n  \"token\": \"LTC\",\n  \"amountRaw\": \"100000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Litecoin testnet (chainId 803). BIP84 m/84'/1'/0'/0/N → tltc1q… addresses. Esplora coverage is thinner; deployments typically self-host Electrs/Esplora. BlockCypher has no LTC testnet endpoint, so push detection is unavailable here — Esplora poll only."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
               "name": "Dev chain — DEV (1 DEV)",
               "request": {
                 "method": "POST",
@@ -1796,6 +1824,63 @@
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
             "description": "Skips the rest of the universe and only snapshots one address. Cheapest possible call — handy when an operator wants to verify a specific wallet without paying the full sweep cost."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin / UTXO RBF (bump fee)",
+      "description": "Replace-By-Fee for stuck UTXO payouts. Bumps a payout's fee on demand when its tx is sitting in the mempool past the merchant's patience. BIP125-compliant: shares inputs with the prior attempt, has strictly higher absolute fee, exceeds the relay's incremental-fee threshold. Strategy cascade: shrink_change → drop_change → add_inputs.",
+      "item": [
+        {
+          "name": "Bump fee — high tier (default)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/payouts/{{payoutId}}/bump-fee",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "payouts", "{{payoutId}}", "bump-fee"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"tier\": \"high\"\n}" },
+            "description": "Re-queries the chain adapter's high-tier feerate and rebroadcasts at that rate (clamped up by `incremental_relay_fee` if the prior attempt was already paying close to it)."
+          }
+        },
+        {
+          "name": "Bump fee — explicit sat/vB",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/payouts/{{payoutId}}/bump-fee",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "payouts", "{{payoutId}}", "bump-fee"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"satPerVb\": 50\n}" },
+            "description": "Use this when the operator has independent feerate intelligence (mempool.space dashboard, etc.) and wants an exact target rather than the adapter's tier estimate."
+          }
+        },
+        {
+          "name": "Bump fee — dry-run preview",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/payouts/{{payoutId}}/bump-fee",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "payouts", "{{payoutId}}", "bump-fee"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"tier\": \"high\",\n  \"dryRun\": true\n}" },
+            "description": "Computes the strategy + new fee + change without broadcasting. Useful to confirm whether a bump is feasible (insufficient funds, no fee headroom, etc.) before committing."
           }
         }
       ]

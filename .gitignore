@@ -41,3 +41,5 @@ Thumbs.db
 # drizzle generated migrations — schema is applied directly to Turso
 drizzle/
 drizzle-*.ts
+.claude
+claude-*.ts

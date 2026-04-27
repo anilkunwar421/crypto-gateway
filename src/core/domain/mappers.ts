@@ -4,7 +4,8 @@ import type { ChainFamily } from "../types/chain.js";
 import type { Invoice, InvoiceExtraStatus, InvoiceId, InvoiceReceiveAddress, InvoiceStatus } from "../types/invoice.js";
 import type { Payout, PayoutId, PayoutStatus } from "../types/payout.js";
 import type { Transaction, TransactionId, TxStatus } from "../types/transaction.js";
-import { invoices, invoiceReceiveAddresses, payouts, transactions } from "../../db/schema.js";
+import { invoices, invoiceReceiveAddresses } from "../../db/schema.js";
+import type { payouts, transactions } from "../../db/schema.js";
 
 // DB row <-> domain object conversions. Kept in one place so invoice.service.ts
 // and payment.service.ts don't drift on shape.

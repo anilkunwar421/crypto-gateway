@@ -2063,6 +2063,121 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /admin/payouts/{id}/bump-fee:
+    post:
+      tags: [admin, payouts, utxo, rbf]
+      summary: RBF — replace a stuck UTXO payout's tx at a higher fee
+      description: |
+        UTXO-only. Bumps the fee on a payout whose tx is sitting in the
+        mempool unconfirmed past the merchant's patience. Builds a
+        BIP125-compliant replacement tx that shares inputs with the prior
+        attempt and has strictly higher absolute fee. Replacement strategy
+        in order:
+          - **shrink_change** — same inputs, change output reduced to absorb the bump
+          - **drop_change** — same inputs, no change output (everything left becomes fee)
+          - **add_inputs** — same inputs PLUS additional spendable UTXOs
+
+        Each attempt is journaled in `payout_broadcasts` (txid, fee, vsize,
+        inputs, change). Cap of 10 bumps per payout.
+
+        Errors:
+          - 404 `PAYOUT_NOT_FOUND` — no payout with that id
+          - 400 `WRONG_FAMILY` — non-UTXO chain (EVM/Tron/Solana)
+          - 400 `WRONG_STATUS` — payout not currently `submitted`
+          - 400 `ALREADY_CONFIRMED` — tx already mined; bump is moot
+          - 400 `MAX_ATTEMPTS` — payout has hit the 10-bump cap
+          - 400 `FEE_NOT_HIGHER` — replacement fee wouldn't beat prior fee
+          - 409 `CONFLICT` — concurrent bump in flight; retry once it completes
+          - 422 `INSUFFICIENT_FUNDS` — even Step 3 (add inputs) can't cover the fee
+          - 502 `BROADCAST_FAILED` — relay rejected the replacement
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  properties:
+                    tier:
+                      type: string
+                      enum: [low, medium, high]
+                      description: Use the adapter's current fee estimate at the requested tier.
+                    dryRun:
+                      type: boolean
+                      description: Preview the replacement without broadcasting.
+                - type: object
+                  required: [satPerVb]
+                  properties:
+                    satPerVb:
+                      type: number
+                      minimum: 1
+                      maximum: 10000
+                      description: Explicit replacement feerate in sat/vB.
+                    dryRun:
+                      type: boolean
+            example:
+              tier: high
+              dryRun: false
+      responses:
+        "200":
+          description: Bump succeeded; new tx broadcast
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bump:
+                    type: object
+                    properties:
+                      payoutId: { type: string }
+                      attemptNumber: { type: integer, description: "1-indexed; initial broadcast is 1" }
+                      txHash: { type: string }
+                      priorTxHash: { type: string }
+                      priorFeeSats: { type: string }
+                      newFeeSats: { type: string }
+                      priorFeerateSatVb: { type: string }
+                      newFeerateSatVb: { type: string }
+                      vsize: { type: integer }
+                      strategy:
+                        type: string
+                        enum: [shrink_change, drop_change, add_inputs]
+                      changeAddress: { type: string, nullable: true }
+                      changeValueSats: { type: string, nullable: true }
+                      dryRun: { type: boolean }
+        "400":
+          description: WRONG_FAMILY / WRONG_STATUS / ALREADY_CONFIRMED / MAX_ATTEMPTS / FEE_NOT_HIGHER
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: PAYOUT_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: CONFLICT — concurrent bump in flight for the same payout
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: INSUFFICIENT_FUNDS — even after adding all spendable UTXOs, can't cover the fee
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: BROADCAST_FAILED — relay rejected the replacement
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /admin/fee-wallets/tron/freeze:
     post:
       tags: [admin, fee-wallets, tron]

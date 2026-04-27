@@ -37,6 +37,8 @@ export const CHAIN_REGISTRY: readonly ChainEntry[] = [
   // testnet) and additional UTXO chains (BCH, DOGE, Zcash transparent) later.
   { chainId: 800 as ChainId, slug: "bitcoin", family: "utxo", displayName: "Bitcoin" },
   { chainId: 801 as ChainId, slug: "litecoin", family: "utxo", displayName: "Litecoin" },
+  { chainId: 802 as ChainId, slug: "bitcoin-testnet", family: "utxo", displayName: "Bitcoin Testnet3" },
+  { chainId: 803 as ChainId, slug: "litecoin-testnet", family: "utxo", displayName: "Litecoin Testnet" },
   // Dev chain used by integration tests
   { chainId: 999 as ChainId, slug: "dev", family: "evm", displayName: "Dev Chain" }
 ];

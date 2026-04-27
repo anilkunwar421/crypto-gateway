@@ -193,6 +193,71 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
     return c.json({ received: true }, 200);
   });
 
+  // POST /webhooks/blockcypher/:chainId
+  //
+  // BlockCypher pushes a tx-confirmation payload here when a watched UTXO
+  // address receives or confirms a transaction. The chainId is in the URL
+  // path (not the payload) so:
+  //   1. The route handler decides which chain context to load.
+  //   2. The URL itself acts as a routing token — different chains get
+  //      different webhook URLs, registered separately with BlockCypher.
+  //
+  // Authentication: BlockCypher doesn't HMAC payloads. Instead, the URL
+  // itself is the secret — a `?token=<random>` query param the operator
+  // generates once and registers with BlockCypher. We validate it against
+  // `BLOCKCYPHER_INGEST_TOKEN` env (when set) before processing.
+  // Without the env var set, the route accepts any caller — fine for a
+  // private deployment behind a firewall, dangerous on the public internet.
+  // Production deployments should always set the token.
+  //
+  // The route ack is fast: defer the actual ingest to deps.jobs so a
+  // slow DB write doesn't block BlockCypher's retry budget.
+  app.post("/blockcypher/:chainId", async (c) => {
+    const chainIdRaw = c.req.param("chainId");
+    const chainId = Number.parseInt(chainIdRaw, 10);
+    if (!Number.isFinite(chainId) || chainId <= 0) {
+      return c.json({ error: { code: "BAD_CHAIN_ID" } }, 400);
+    }
+    // Optional URL token. When `BLOCKCYPHER_INGEST_TOKEN` is set we require
+    // it; otherwise the route accepts any caller.
+    const expectedToken = deps.secrets.getOptional("BLOCKCYPHER_INGEST_TOKEN");
+    if (expectedToken !== undefined && expectedToken.length > 0) {
+      const provided = c.req.query("token") ?? "";
+      // Constant-time compare to avoid timing oracle on the token.
+      if (!constantTimeEqualHex(provided, expectedToken)) {
+        return c.json({ error: { code: "UNAUTHORIZED" } }, 401);
+      }
+    }
+    const strategy = deps.pushStrategies["blockcypher-notify"];
+    if (strategy === undefined) {
+      return c.json(
+        { error: { code: "NOT_CONFIGURED", message: "BlockCypher ingest not enabled" } },
+        404
+      );
+    }
+    const rawBody = await c.req.text();
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    // Inject chainId so the strategy can resolve which chain's owned-address
+    // set to filter outputs against.
+    (payload as { chainId?: number }).chainId = chainId;
+
+    deps.jobs.defer(
+      async () => {
+        const transfers = await strategy.handlePush!(deps, payload);
+        for (const transfer of transfers) {
+          await ingestDetectedTransfer(deps, transfer);
+        }
+      },
+      { name: "blockcypher-notify-ingest" }
+    );
+    return c.json({ received: true }, 200);
+  });
+
   return app;
 }
 

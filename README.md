@@ -363,6 +363,8 @@ registered for that chainId).
 | Solana devnet | 901 | SOL | — |
 | Bitcoin | 800 | BTC | — |
 | Litecoin | 801 | LTC | — |
+| Bitcoin testnet3 | 802 | BTC | — |
+| Litecoin testnet | 803 | LTC | — |
 
 Notes:
 - **Decimals differ.** Most stables are 6 decimals; BNB-chain USDC/USDT are
@@ -396,6 +398,12 @@ monotonically-incremented index:
 | --- | --- | --- | --- |
 | Bitcoin (chainId 800) | `m/84'/0'/0'/0/N` | `bc1q…` (P2WPKH) | `bc` |
 | Litecoin (chainId 801) | `m/84'/2'/0'/0/N` | `ltc1q…` (P2WPKH) | `ltc` |
+| Bitcoin testnet3 (chainId 802) | `m/84'/1'/0'/0/N` | `tb1q…` (P2WPKH) | `tb` |
+| Litecoin testnet (chainId 803) | `m/84'/1'/0'/0/N` | `tltc1q…` (P2WPKH) | `tltc` |
+
+Testnets share BIP44 `coin_type=1` per slip-0044, so a single `MASTER_SEED`
+derives different addresses for BTC testnet vs LTC testnet (the chains are
+independent, so addresses can't collide on-chain).
 
 The same seed produces identical addresses in Electrum, Sparrow, Ledger
 Live, Trezor Suite, and any other BIP84-compliant wallet. Verified against
@@ -447,16 +455,84 @@ requests a BTC/LTC payout:
 
 - Bitcoin (chainId 800): **6 confirmations** (~60 minutes at 10-min blocks)
 - Litecoin (chainId 801): **12 confirmations** (~30 minutes at 2.5-min blocks)
+- Bitcoin testnet3 (chainId 802) / Litecoin testnet (chainId 803): **1 confirmation**
+  (test environments — fast iteration over finality)
+
+**Destination address types.** Outbound payouts accept any standard
+address format on the chain:
+
+| Family | Mainnet prefix | Testnet prefix | Encoding |
+| --- | --- | --- | --- |
+| P2PKH (legacy) | `1…` (BTC) / `L…` (LTC) | `m…`/`n…` | base58check |
+| P2SH | `3…` (BTC) / `M…` or `3…` (LTC) | `2…` | base58check |
+| P2WPKH (native segwit) | `bc1q…` / `ltc1q…` | `tb1q…` / `tltc1q…` | bech32 v0 |
+| P2WSH | `bc1q…` (32-byte program) | `tb1q…` | bech32 v0 |
+| P2TR (taproot) | `bc1p…` | `tb1p…` | bech32m v1 |
+
+Receive addresses we issue ourselves stay strictly P2WPKH (modern, cheaper
+inputs, smaller scripts). LTC mainnet P2SH accepts both the legacy `0x05`
+("3…") and modern `0x32` ("M…") version bytes for backward compatibility.
+
+**RBF (Replace-By-Fee) for stuck payouts.** When a UTXO payout's tx sits in
+the mempool past the merchant's patience — feerates spiked or the original
+estimate was too low — admins can call `POST /admin/payouts/:id/bump-fee`
+to rebroadcast at a higher fee. Body (optional):
+
+```json
+{ "tier": "high" }                 // current high-tier rate from the adapter
+{ "satPerVb": 50 }                 // explicit override
+{ "tier": "high", "dryRun": true } // preview the strategy without broadcasting
+```
+
+The gateway is BIP125-compliant: shares inputs with the prior attempt, has
+strictly higher absolute fee, and exceeds the relay's incremental-fee
+threshold. Replacement strategy in order: shrink change → drop change →
+add inputs from the spendable pool. Each attempt is journaled in
+`payout_broadcasts` (txid, fee, vsize, inputs, change). The cap is 10 bumps
+per payout.
+
+**BlockCypher push detection (optional, per-chain).** Configure per-chain
+to subscribe to invoice-scoped hooks via BlockCypher's `/v1/{coin}/{net}/hooks`
+API. Sub-5s detection latency vs Esplora's 30s poll. The system works
+correctly with or without BlockCypher — push is purely a latency accelerator.
+
+Each UTXO chain reads its own env var pair, keyed by the chain `slug`:
+
+| Chain | Token env | Callback URL env |
+| --- | --- | --- |
+| Bitcoin (chainId 800) | `BLOCKCYPHER_TOKEN_BITCOIN` | `BLOCKCYPHER_CALLBACK_URL_BITCOIN` |
+| Litecoin (chainId 801) | `BLOCKCYPHER_TOKEN_LITECOIN` | `BLOCKCYPHER_CALLBACK_URL_LITECOIN` |
+| Bitcoin testnet3 (chainId 802) | `BLOCKCYPHER_TOKEN_BITCOIN_TESTNET` | `BLOCKCYPHER_CALLBACK_URL_BITCOIN_TESTNET` |
+| Litecoin testnet (chainId 803) | — | — (BlockCypher has no LTC testnet endpoint) |
+
+A chain is BlockCypher-enabled when **both** envs are non-empty. Setting
+only one is a hard boot error. Skipping a chain entirely keeps it on
+Esplora-poll detection. Inbound webhook auth uses a single shared
+`BLOCKCYPHER_INGEST_TOKEN` validated as a `?token=` query param at
+`/webhooks/blockcypher/:chainId`.
+
+Per-chain config has three operational benefits:
+- **Independent free-tier quotas**: BlockCypher's free tier caps at 200
+  active hooks per account. Separate accounts per chain = separate caps.
+- **Independent failure domains**: a stuck BTC subscription doesn't
+  starve LTC's hook quota.
+- **Plug-and-play for future chains** (DASH, DOGE, BCH): add the chain
+  config to `utxo-config.ts` + a `<CHAIN_SLUG>_BIP84_*` factory and set
+  `BLOCKCYPHER_TOKEN_<SLUG>` / `BLOCKCYPHER_CALLBACK_URL_<SLUG>` in env;
+  no entrypoint or sweep code changes.
+
+> **Breaking change:** the legacy single-form `BLOCKCYPHER_TOKEN` and
+> `BLOCKCYPHER_CALLBACK_URL` env vars are no longer recognized. Existing
+> deployments must migrate to the per-chain names before redeploy. The
+> gateway logs a WARN at startup if legacy vars are detected and treats
+> BlockCypher as disabled until per-chain config is provided.
 
 **Out of scope for v1** (deferred to follow-ups):
 
-- Testnet support (BTC testnet3 / signet, LTC testnet)
-- RBF (replace-by-fee) for stuck payouts
-- Address types other than native segwit (legacy `1…`, P2SH-segwit `3…`,
-  taproot `bc1p…`)
-- BlockCypher push-detection accelerator (planned; system works correctly
-  on Esplora poll alone)
 - Lightning Network
+- Address types other than the five listed above (multisig P2MS,
+  pre-segwit RBF, etc.)
+- BCH / DOGE / Zcash-transparent (additional UTXO chains under the same family)
 
 ## Multi-family invoice acceptance
 

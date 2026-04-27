@@ -437,6 +437,24 @@ export const payouts = sqliteTable(
     // into a second on-chain tx.
     broadcastAttemptedAt: integer("broadcast_attempted_at"),
 
+    // ---- RBF (Replace-By-Fee) audit trail ----
+    //
+    // UTXO-only. Track the chain of replacements when an admin bumps the fee
+    // on a stuck payout. Non-UTXO families never write here (account-model
+    // chains have no equivalent of mempool replacement).
+    //
+    // `originalTxHash` is the FIRST broadcast's txid — preserved across
+    // replacements so the admin UI can correlate "this payout's history"
+    // even after multiple bumps. NULL on initial broadcast (txHash is the
+    // original); set on first bump to the value of `txHash` BEFORE the
+    // replacement overwrites it.
+    originalTxHash: text("original_tx_hash"),
+    // Count of successful RBF replacements. Incremented by the bump-fee
+    // endpoint after a confirmed broadcast. Surfaced in the merchant API
+    // for transparency.
+    feeBumpAttempts: integer("fee_bump_attempts").notNull().default(0),
+    lastFeeBumpAt: integer("last_fee_bump_at"),
+
     // Per-payout webhook override. Same semantics as invoices.webhook_url:
     // write-once, URL+secret paired, fall back to merchant default when NULL.
     webhookUrl: text("webhook_url"),
@@ -464,6 +482,72 @@ export const payouts = sqliteTable(
     check(
       "payouts_fee_tier_check",
       sql`${t.feeTier} IS NULL OR ${t.feeTier} IN ('low','medium','high')`
+    )
+  ]
+);
+
+// ---- payout_broadcasts (UTXO RBF audit trail + crash-consistency log) ----
+//
+// One row per broadcast attempt for a UTXO payout. The very first broadcast
+// gets attempt_number=1; each fee bump appends attempt_number=N+1. Used for:
+//   1. Crash consistency: a 'creating' row exists for the in-flight bump
+//      before broadcast hits the network. If we crash after broadcast but
+//      before the commit, the next admin retry sees the row and either
+//      validates the broadcast landed (querying esplora getTx) or treats
+//      the slot as failed.
+//   2. Admin UI: exposes "fee bump history for this payout" — shows the
+//      tx hashes, fees paid, and which one finally confirmed.
+//   3. BIP125 enforcement: the prior attempt's `feeSats` and `feerateSatVb`
+//      are read at bump time to enforce the strict-fee-increase rule.
+//
+// Only ever written by the UTXO RBF code path; account-model payouts (EVM,
+// Tron, Solana) have no rows here.
+export const payoutBroadcasts = sqliteTable(
+  "payout_broadcasts",
+  {
+    id: text("id").primaryKey(),
+    payoutId: text("payout_id")
+      .notNull()
+      .references(() => payouts.id),
+    // 1-indexed broadcast count for this payout. The initial submission is
+    // attempt 1; bumps are 2, 3, ...
+    attemptNumber: integer("attempt_number").notNull(),
+    txHash: text("tx_hash").notNull(),
+    // Full hex of the signed segwit tx. Stored for provenance and so the
+    // admin can re-broadcast if the network drops the tx (no
+    // re-construction/re-signing needed).
+    rawHex: text("raw_hex").notNull(),
+    feeSats: text("fee_sats").notNull(),
+    vsize: integer("vsize").notNull(),
+    feerateSatVb: text("feerate_sat_vb").notNull(),
+    // JSON of `[{ utxoId, txid, vout, value, scriptPubkey, address }]` —
+    // the inputs this attempt consumed. Used to revalidate the input set
+    // when building a follow-up bump (must overlap with prior attempt).
+    inputsJson: text("inputs_json").notNull(),
+    // Change output address (P2WPKH derived fresh each attempt) and value.
+    // NULL when the attempt drops change entirely (fees consumed it).
+    changeAddress: text("change_address"),
+    changeValueSats: text("change_value_sats"),
+    // Lifecycle:
+    //   creating  — DB row inserted, broadcast not yet attempted
+    //   submitted — broadcast acknowledged by network
+    //   replaced  — superseded by a later attempt (RBF chain)
+    //   failed    — broadcast errored OR the attempt was abandoned
+    status: text("status", { enum: ["creating", "submitted", "replaced", "failed"] })
+      .notNull()
+      .default("creating"),
+    // attemptNumber of the row that replaced THIS one. Set when status=replaced.
+    replacedByAttempt: integer("replaced_by_attempt"),
+    lastError: text("last_error"),
+    broadcastAt: integer("broadcast_at"),
+    createdAt: integer("created_at").notNull()
+  },
+  (t) => [
+    uniqueIndex("uq_payout_broadcasts_attempt").on(t.payoutId, t.attemptNumber),
+    index("idx_payout_broadcasts_payout").on(t.payoutId, sql`${t.attemptNumber} DESC`),
+    check(
+      "payout_broadcasts_status_check",
+      sql`${t.status} IN ('creating','submitted','replaced','failed')`
     )
   ]
 );
@@ -501,6 +585,64 @@ export const alchemyAddressSubscriptions = sqliteTable(
     index("idx_alchemy_subs_pending").on(t.status, t.chainId, t.lastAttemptAt),
     check("alchemy_subs_action_check", sql`${t.action} IN ('add','remove')`),
     check("alchemy_subs_status_check", sql`${t.status} IN ('pending','synced','failed')`)
+  ]
+);
+
+// ---- blockcypher_subscriptions (UTXO push-detection accelerator) ----
+//
+// BlockCypher's `/v1/{coin}/{net}/hooks` lets us subscribe per-address for
+// `tx-confirmation` events — push notifications that fire as soon as a tx
+// touching a watched address hits the mempool (and again per confirmation
+// up to 6). This shaves detection latency from the Esplora poll's ~30s
+// down to sub-5s for active invoices.
+//
+// Lifecycle is invoice-scoped (UTXO has no pool; addresses don't get reused
+// across invoices, so subscriptions don't either):
+//   invoice.created           -> 'subscribe' row
+//   invoice.completed/expired/canceled -> 'unsubscribe' row (frees BlockCypher
+//                                         hook quota — free tier caps at 200
+//                                         active hooks)
+//
+// `hookId` is set when a 'subscribe' op succeeds (BlockCypher returns it on
+// hook creation; we'll need it later for DELETE). For 'unsubscribe' rows it
+// carries the hookId we're trying to free.
+//
+// `coinPath` is BlockCypher's coin/net slug ("btc/main" or "ltc/main").
+// Stored on the row so the sweeper doesn't need a chainId-to-path map at
+// query time and so a future testnet add (chainId 802 → "btc/test3") slots
+// in cleanly.
+export const blockcypherSubscriptions = sqliteTable(
+  "blockcypher_subscriptions",
+  {
+    id: text("id").primaryKey(),
+    chainId: integer("chain_id").notNull(),
+    coinPath: text("coin_path").notNull(),
+    address: text("address").notNull(),
+    action: text("action", { enum: ["subscribe", "unsubscribe"] }).notNull(),
+    // BlockCypher's hook id. Set when a subscribe succeeds. Pre-populated
+    // on unsubscribe rows so the sweeper knows which hook to DELETE.
+    hookId: text("hook_id"),
+    status: text("status", { enum: ["pending", "synced", "failed"] }).notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    lastAttemptAt: integer("last_attempt_at"),
+    lastError: text("last_error"),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull()
+  },
+  (t) => [
+    index("idx_blockcypher_subs_pending").on(t.status, t.chainId, t.lastAttemptAt),
+    // Reverse lookup: "what's the hookId for address X?" — used by the
+    // tracker when enqueueing an unsubscribe to find the prior subscribe's
+    // hookId without scanning.
+    index("idx_blockcypher_subs_by_address").on(t.chainId, t.address),
+    check(
+      "blockcypher_subs_action_check",
+      sql`${t.action} IN ('subscribe','unsubscribe')`
+    ),
+    check(
+      "blockcypher_subs_status_check",
+      sql`${t.status} IN ('pending','synced','failed')`
+    )
   ]
 );
 
@@ -706,6 +848,7 @@ export const schema = {
   payouts,
   alchemyWebhookRegistry,
   alchemyAddressSubscriptions,
+  blockcypherSubscriptions,
   addressPool,
   invoiceReceiveAddresses,
   webhookDeliveries

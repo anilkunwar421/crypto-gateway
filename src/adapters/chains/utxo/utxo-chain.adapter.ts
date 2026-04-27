@@ -10,11 +10,13 @@ import type { DetectedTransfer } from "../../../core/types/transaction.js";
 import type { BuildTransferArgs, EstimateArgs, UnsignedTx } from "../../../core/types/unsigned-tx.js";
 import { bytesToHex } from "../../crypto/subtle.js";
 import {
-  decodeP2wpkhAddress,
   encodeP2wpkhAddress,
-  hash160,
-  isValidP2wpkhAddress
+  hash160
 } from "./bech32-address.js";
+import {
+  isValidDestinationAddress,
+  decodeUtxoDestination
+} from "./destination-script.js";
 import {
   esploraClient,
   EsploraNotFoundError,
@@ -30,7 +32,9 @@ import {
 import type { UtxoInput, UtxoOutput } from "./utxo-tx-encode.js";
 import {
   BITCOIN_CONFIG,
+  BITCOIN_TESTNET_CONFIG,
   LITECOIN_CONFIG,
+  LITECOIN_TESTNET_CONFIG,
   utxoConfigForChainId,
   type UtxoChainConfig
 } from "./utxo-config.js";
@@ -102,23 +106,30 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
     },
 
     validateAddress(addr: string): boolean {
-      return isValidP2wpkhAddress(addr, chain.bech32Hrp);
+      // Accepts any destination type a merchant might pay TO: P2PKH (1...),
+      // P2SH (3.../M.../L...), P2WPKH (bc1q.../tb1q.../ltc1q.../tltc1q...),
+      // P2WSH (bech32 32-byte program), and P2TR (bech32m, bc1p.../tb1p...).
+      // Receive addresses we GENERATE are still strictly P2WPKH — see
+      // deriveAddress / addressFromPrivateKey below.
+      return isValidDestinationAddress(addr, chain);
     },
 
     canonicalizeAddress(addr: string): Address {
-      // Bech32 is case-sensitive but the spec mandates a single case per
-      // address (mixed case is invalid). BIP173 also REQUIRES lowercase for
-      // QR codes and explicitly says implementations SHOULD lowercase.
-      // We lowercase for storage so DB joins are case-stable, and reject
-      // anything that doesn't decode to a v0 P2WPKH for this chain's HRP.
-      const lowered = addr.toLowerCase();
-      const decoded = decodeP2wpkhAddress(lowered);
-      if (decoded === null || decoded.hrp !== chain.bech32Hrp) {
+      // Decode handles case discipline internally — bech32 path lowercases,
+      // base58 path preserves case (the checksum is case-sensitive). On
+      // success we return the canonical form per address family:
+      //   - bech32/bech32m → lowercase (BIP173/350 forbid mixed case)
+      //   - base58check    → original casing verbatim
+      const decoded = decodeUtxoDestination(addr, chain);
+      if (decoded === null) {
         throw new Error(
-          `Invalid ${chain.slug} P2WPKH address: ${addr} (expected hrp='${chain.bech32Hrp}')`
+          `Invalid ${chain.slug} address: ${addr} (expected P2PKH, P2SH, P2WPKH, P2WSH, or P2TR for hrp='${chain.bech32Hrp}')`
         );
       }
-      return lowered as Address;
+      if (decoded.type === "p2wpkh" || decoded.type === "p2wsh" || decoded.type === "p2tr") {
+        return addr.toLowerCase() as Address;
+      }
+      return addr as Address;
     },
 
     addressFromPrivateKey(privateKey: string): Address {
@@ -483,6 +494,14 @@ export function bitcoinChainAdapter(): ChainAdapter {
 
 export function litecoinChainAdapter(): ChainAdapter {
   return utxoChainAdapter({ chain: LITECOIN_CONFIG });
+}
+
+export function bitcoinTestnetChainAdapter(): ChainAdapter {
+  return utxoChainAdapter({ chain: BITCOIN_TESTNET_CONFIG });
+}
+
+export function litecoinTestnetChainAdapter(): ChainAdapter {
+  return utxoChainAdapter({ chain: LITECOIN_TESTNET_CONFIG });
 }
 
 // ---- Internal helpers ----

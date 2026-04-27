@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { bootTestApp } from "../helpers/boot.js";
+import type { AppDeps } from "../../core/app-deps.js";
 import { utxoChainAdapter } from "../../adapters/chains/utxo/utxo-chain.adapter.js";
 import { BITCOIN_CONFIG } from "../../adapters/chains/utxo/utxo-config.js";
 import type {
@@ -431,7 +432,7 @@ describe("UTXO end-to-end lifecycle (Bitcoin)", () => {
 // → derive keys → signSegwitTx. We don't run this in production code;
 // it's purely for the test to know what txid the adapter will produce.
 async function precomputeBroadcastTxid(
-  deps: import("../../core/app-deps.js").AppDeps,
+  deps: AppDeps,
   payoutId: string
 ): Promise<{ hex: string; txid: string }> {
   const { selectCoins, loadSpendableUtxos } = await import(

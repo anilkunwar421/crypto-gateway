@@ -6,7 +6,15 @@ import {
   bitcoinChainAdapter,
   litecoinChainAdapter
 } from "../adapters/chains/utxo/utxo-chain.adapter.js";
-import { BITCOIN_CONFIG, LITECOIN_CONFIG } from "../adapters/chains/utxo/utxo-config.js";
+import {
+  BITCOIN_CONFIG,
+  LITECOIN_CONFIG,
+  utxoConfigForChainId
+} from "../adapters/chains/utxo/utxo-config.js";
+import { loadBlockcypherChainConfigs } from "../adapters/detection/blockcypher-config.js";
+import { dbBlockcypherSubscriptionStore } from "../adapters/detection/blockcypher-subscription-store.js";
+import { makeBlockcypherSyncSweep } from "../adapters/detection/blockcypher-sync-sweep.js";
+import { blockcypherNotifyDetection } from "../adapters/detection/blockcypher-notify.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
@@ -245,11 +253,58 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     alchemy = { syncAddresses: sweep };
   }
 
+  // BlockCypher push-detection accelerator (mirror of node.ts wiring).
+  // Per-chain config: each UTXO chain registered in `chains` reads its own
+  //   BLOCKCYPHER_TOKEN_<SLUG> + BLOCKCYPHER_CALLBACK_URL_<SLUG>
+  // env-var pair (e.g. BLOCKCYPHER_TOKEN_BITCOIN, _LITECOIN, _BITCOIN_TESTNET).
+  // Setting only one of the pair is a hard boot error. Chains BlockCypher
+  // doesn't cover (LTC testnet, blockcypherCoinPath=null) are skipped silently.
+  let blockcypher: AppDeps["blockcypher"];
+  let blockcypherPushStrategy: ReturnType<typeof blockcypherNotifyDetection> | undefined;
+  const workerSecrets = workersEnvSecrets(env as unknown as Record<string, unknown>);
+  const blockcypherConfigs = loadBlockcypherChainConfigs({
+    secrets: workerSecrets,
+    chains,
+    logger
+  });
+  if (blockcypherConfigs.size > 0) {
+    const sweep = makeBlockcypherSyncSweep({
+      store: dbBlockcypherSubscriptionStore(db),
+      configByChainId: blockcypherConfigs,
+      logger,
+      clock: { now: () => new Date() }
+    });
+    blockcypher = {
+      syncSubscriptions: sweep,
+      configuredChainIds: new Set(blockcypherConfigs.keys())
+    };
+    blockcypherPushStrategy = blockcypherNotifyDetection(
+      async (innerDeps, chainId) => {
+        const { invoices } = await import("../db/schema.js");
+        const { eq } = await import("drizzle-orm");
+        const rows = await innerDeps.db
+          .select({ address: invoices.receiveAddress })
+          .from(invoices)
+          .where(eq(invoices.chainId, chainId));
+        const set = new Set<string>();
+        for (const r of rows) set.add(r.address.toLowerCase());
+        const cfg = utxoConfigForChainId(chainId);
+        const native = cfg?.nativeSymbol ?? "BTC";
+        return { chainId, nativeSymbol: native as "BTC" | "LTC", ourAddresses: set };
+      }
+    );
+    const enabledSlugs = Array.from(blockcypherConfigs.values()).map((c) => c.slug);
+    logger.info("BlockCypher accelerator wired (per-chain)", {
+      chains: enabledSlugs,
+      chainCount: blockcypherConfigs.size
+    });
+  }
+
   return {
     db,
     cache,
     jobs: waitUntilJobs(ctx),
-    secrets: workersEnvSecrets(env as unknown as Record<string, unknown>),
+    secrets: workerSecrets,
     secretsCipher,
     feeWalletStore,
     signerStore: hdSignerStore({
@@ -294,9 +349,15 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     },
     chains,
     detectionStrategies,
-    pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
+    pushStrategies: {
+      "alchemy-notify": alchemyNotifyDetection(),
+      ...(blockcypherPushStrategy !== undefined
+        ? { "blockcypher-notify": blockcypherPushStrategy }
+        : {})
+    },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
+    ...(blockcypher !== undefined ? { blockcypher } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     confirmationThresholds: parseFinalityOverridesEnv(
       typeof env["FINALITY_OVERRIDES"] === "string" ? env["FINALITY_OVERRIDES"] : undefined

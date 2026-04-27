@@ -18,13 +18,12 @@ import { addressPool, merchants, payoutReservations, payouts, utxos } from "../.
 import { computeSpendable } from "./balance-snapshot.service.js";
 import { loadSpendableUtxos, selectCoins } from "./utxo-coin-select.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
+import { buildUtxoUnsignedTx } from "../../adapters/chains/utxo/utxo-chain.adapter.js";
 import {
-  buildUtxoUnsignedTx,
-  type UtxoUnsignedRaw
-} from "../../adapters/chains/utxo/utxo-chain.adapter.js";
-import {
-  decodeP2wpkhAddress
-} from "../../adapters/chains/utxo/bech32-address.js";
+  destinationScriptPubkey
+} from "../../adapters/chains/utxo/destination-script.js";
+import { utxoConfigForChainId } from "../../adapters/chains/utxo/utxo-config.js";
+import { journalInitialBroadcast, type RbfInput } from "./payout-rbf.js";
 
 // PayoutService lifecycle:
 //
@@ -1764,23 +1763,32 @@ async function broadcastUtxoMain(
     // entry without `address` is the change output, which we synthesize a
     // fresh receive address for (one-shot, never reused — same privacy
     // discipline as invoice receive addresses).
+    //
+    // Merchant destinations may be P2PKH/P2SH/P2WPKH/P2WSH/P2TR (validated
+    // upstream at planPayout via chainAdapter.validateAddress). Change
+    // outputs are always P2WPKH because we generate them ourselves via
+    // BIP84. `destinationScriptPubkey` produces the right script for either.
+    const utxoCfg = utxoConfigForChainId(Number(row.chainId));
+    if (utxoCfg === null) {
+      throw new Error(`broadcastUtxoMain: no UTXO config for chainId ${row.chainId}`);
+    }
     const seed = deps.secrets.getRequired("MASTER_SEED");
     const outputs: Array<{ scriptPubkey: string; value: bigint }> = [];
     let changeAddressIndex: number | null = null;
     let changeAddress: string | null = null;
     for (const o of selection.outputs) {
       if (o.address === undefined) {
-        // Change output: allocate a fresh address from the same counter.
+        // Change output: allocate a fresh P2WPKH address from the same counter.
         const allocated = await allocateUtxoAddress(deps, chainAdapter, row.chainId as ChainId, seed);
         changeAddress = allocated.address;
         changeAddressIndex = allocated.addressIndex;
         outputs.push({
-          scriptPubkey: p2wpkhScriptPubkey(allocated.address),
+          scriptPubkey: destinationScriptPubkey(allocated.address, utxoCfg),
           value: BigInt(o.value)
         });
       } else {
         outputs.push({
-          scriptPubkey: p2wpkhScriptPubkey(o.address),
+          scriptPubkey: destinationScriptPubkey(o.address, utxoCfg),
           value: BigInt(o.value)
         });
       }
@@ -1810,14 +1818,26 @@ async function broadcastUtxoMain(
 
     const txHash = await chainAdapter.signAndBroadcast(unsigned, "", { inputPrivateKeys });
 
-    // Atomically mark UTXOs spent + flip the payout to `submitted`. If the
-    // broadcast succeeded but this DB transaction fails, the next executor
-    // tick re-enters `broadcastUtxoMain`, the broadcastAttemptedAt CAS
-    // returns deferred (already set), and a retry from a different tick
-    // would see `status='reserved'` still — but this should be rare; the
-    // DB tx is local writes only, no external I/O.
+    // Atomically mark UTXOs spent + flip the payout to `submitted` + journal
+    // attempt 1 in payout_broadcasts (the RBF audit log). If the broadcast
+    // succeeded but this DB transaction fails, the next executor tick
+    // re-enters `broadcastUtxoMain`, the broadcastAttemptedAt CAS returns
+    // deferred (already set). The DB tx is local writes only — no external I/O.
     const now2 = deps.clock.now().getTime();
     const utxoIds = selection.chosenInputs.map((u) => u.utxoId);
+    // Estimate vsize for the journaled attempt — coinselect's fee already
+    // reflects the chosen vbyte budget so we recover it via fee/feeRate.
+    const estimatedVsize = Math.max(1, Math.round(selection.fee / feeRate));
+    const rbfInputs: RbfInput[] = selection.chosenInputs.map((u) => ({
+      utxoId: u.utxoId,
+      txid: u.txId,
+      vout: u.vout,
+      value: u.value,
+      scriptPubkey: u.scriptPubkey,
+      address: u.address,
+      addressIndex: u.addressIndex
+    }));
+    const changeOutput = selection.outputs.find((o) => o.address === undefined);
     await deps.db.transaction(async (tx) => {
       await tx
         .update(utxos)
@@ -1835,6 +1855,17 @@ async function broadcastUtxoMain(
           feeEstimateNative: selection.fee.toString()
         })
         .where(eq(payouts.id, row.id));
+      await journalInitialBroadcast(deps, {
+        payoutId: row.id,
+        txHash: String(txHash),
+        feeSats: BigInt(selection.fee),
+        vsize: estimatedVsize,
+        feerateSatVb: feeRate,
+        inputs: rbfInputs,
+        changeAddress,
+        changeValueSats: changeOutput ? BigInt(changeOutput.value) : null,
+        tx
+      });
     });
 
     deps.logger.info("payout.utxo.broadcast", {
@@ -1862,32 +1893,6 @@ async function broadcastUtxoMain(
     const message = err instanceof Error ? err.message : String(err);
     return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
   }
-}
-
-// P2WPKH scriptPubkey from a bech32 address: 0x00 (OP_0) || 0x14 (push 20)
-// || 20-byte hash160. Used by broadcastUtxoMain to convert merchant
-// destination + change addresses into the script form coinselect's outputs
-// and the signing pipeline expect. Throws on non-P2WPKH addresses — UTXO
-// payouts only accept native-segwit destinations in v1 (legacy P2PKH and
-// P2SH-segwit are out of scope; sending TO them would just need a relaxed
-// scriptPubkey computation but we deliberately don't support that yet
-// because it broadens the surface area we'd have to test).
-function p2wpkhScriptPubkey(address: string): string {
-  const decoded = decodeP2wpkhAddress(address.toLowerCase());
-  if (decoded === null) {
-    throw new Error(
-      `payout: destination ${address} is not a P2WPKH bech32 address (legacy / P2SH-segwit / taproot not supported in v1)`
-    );
-  }
-  return `0014${bytesToHexLocal(decoded.program)}`;
-}
-
-function bytesToHexLocal(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 1) {
-    s += bytes[i]!.toString(16).padStart(2, "0");
-  }
-  return s;
 }
 
 // Move a payout to `failed`, release ALL of its reservation rows (the source

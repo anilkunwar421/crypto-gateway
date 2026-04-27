@@ -117,6 +117,26 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
     isStable: false,
     displayName: "Litecoin"
   },
+  // UTXO testnets — chainIds 802 (BTC testnet3) + 803 (LTC testnet). Same
+  // 8-decimal native; addresses use distinct HRPs (tb1q / tltc1q) so a
+  // testnet send to a mainnet address (or vice-versa) fails validation
+  // before signing.
+  {
+    symbol: "BTC" as TokenSymbol,
+    chainId: 802 as ChainId,
+    contractAddress: null,
+    decimals: 8,
+    isStable: false,
+    displayName: "Bitcoin (Testnet3)"
+  },
+  {
+    symbol: "LTC" as TokenSymbol,
+    chainId: 803 as ChainId,
+    contractAddress: null,
+    decimals: 8,
+    isStable: false,
+    displayName: "Litecoin (Testnet)"
+  },
 
   // ===== ERC-20 / TRC-20 / SPL stablecoins =====
   // Ethereum mainnet

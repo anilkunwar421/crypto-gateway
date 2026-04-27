@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { and, asc, eq, isNull, sql } from "drizzle-orm";
+import { asc, eq, isNull, sql } from "drizzle-orm";
 import { payoutReservations, payouts } from "../../db/schema.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import {

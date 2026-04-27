@@ -1,22 +1,22 @@
-import { Hono } from "hono";
-import { and, asc, desc, eq, isNotNull, isNull, type SQL } from "drizzle-orm";
+import { Hono, type Context } from "hono";
+import { and, asc, desc, eq, isNull, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
 import {
   computeBalanceSnapshot,
-  computeSpendable,
   type BalanceSnapshot
 } from "../../core/domain/balance-snapshot.service.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { isTronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains/tron/tron-chain.adapter.js";
-import type { TronResourceKind } from "../../adapters/chains/tron/tron-rpc.js";
+import type { TronResourceKind, TronRpcBackend } from "../../adapters/chains/tron/tron-rpc.js";
+import type { UnsignedTx } from "../../core/types/unsigned-tx.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
 import {
   ingestDetectedTransfer,
   recomputeInvoiceFromTransactions
 } from "../../core/domain/payment.service.js";
 import { confirmationThreshold } from "../../core/domain/payment-config.js";
-import { ChainFamilySchema, type Address, type ChainFamily, type ChainId } from "../../core/types/chain.js";
+import { ChainFamilySchema, type ChainFamily, type ChainId } from "../../core/types/chain.js";
 import { CHAIN_REGISTRY, chainEntry, chainSlug } from "../../core/types/chain-registry.js";
 import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
 import type { TokenSymbol } from "../../core/types/token.js";
@@ -32,7 +32,7 @@ import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registr
 import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
 import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { migrate as drizzleMigrate } from "drizzle-orm/libsql/migrator";
-import { addressPool, alchemyWebhookRegistry, invoices, merchants, payoutReservations, transactions } from "../../db/schema.js";
+import { addressPool, alchemyWebhookRegistry, invoices, merchants, transactions } from "../../db/schema.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
@@ -1532,6 +1532,82 @@ const hasFeeWallet = poolFamilies.has(
     }
   });
 
+  // RBF (Replace-By-Fee) for stuck UTXO payouts. Bumps the fee on a payout
+  // whose tx is sitting in the mempool unconfirmed past the merchant's
+  // patience. The gateway rebroadcasts a tx that shares inputs with the
+  // original (BIP125-compliant) at a higher feerate; once mined, the new
+  // tx settles the merchant's intent and the original is dropped from the
+  // mempool.
+  //
+  // Body (optional):
+  //   { tier: "low" | "medium" | "high" } — fetch current rate from adapter
+  //   { satPerVb: number }                 — explicit override
+  //   { dryRun: true }                     — preview without broadcasting
+  // Default tier: "high".
+  //
+  // Errors:
+  //   404 PAYOUT_NOT_FOUND       — no row for that id
+  //   400 WRONG_FAMILY           — non-UTXO chain
+  //   400 WRONG_STATUS           — payout not currently 'submitted'
+  //   400 ALREADY_CONFIRMED      — tx already mined; bump is moot
+  //   400 MAX_ATTEMPTS           — payout has hit the bump-attempt cap
+  //   400 FEE_NOT_HIGHER         — replacement fee wouldn't beat prior fee
+  //   422 INSUFFICIENT_FUNDS     — even Step 3 (add inputs) can't cover the fee
+  //   502 BROADCAST_FAILED       — relay rejected the replacement
+  app.post("/payouts/:id/bump-fee", async (c) => {
+    const id = c.req.param("id");
+    if (!id || id.length > 64) {
+      return c.json({ error: { code: "INVALID_PAYOUT_ID" } }, 400);
+    }
+    const body = (await c.req.json().catch(() => undefined)) as unknown;
+    try {
+      // Lazy-import to keep the surface tree-shakable on entrypoints that
+      // don't bundle UTXO support (e.g. legacy Workers builds before the
+      // utxo adapter was wired).
+      const { bumpPayoutFee, BumpFeeError } = await import("../../core/domain/payout-rbf.js");
+      try {
+        const result = await bumpPayoutFee(deps, id, body as Parameters<typeof bumpPayoutFee>[2]);
+        return c.json({ bump: result }, 200);
+      } catch (err) {
+        if (err instanceof BumpFeeError) {
+          const statusByCode: Record<typeof err.code, number> = {
+            PAYOUT_NOT_FOUND: 404,
+            WRONG_FAMILY: 400,
+            WRONG_STATUS: 400,
+            ALREADY_CONFIRMED: 400,
+            MAX_ATTEMPTS: 400,
+            FEE_NOT_HIGHER: 400,
+            INSUFFICIENT_FUNDS: 422,
+            BROADCAST_FAILED: 502,
+            CONFLICT: 409,
+            INTERNAL: 500
+          };
+          // BROADCAST_FAILED concatenates the upstream Esplora/relay error
+          // verbatim — the message can carry backend hostnames or echoed
+          // tx hex. Admin-only surface, but tighten anyway: return a stable
+          // generic message; the full upstream error stays in the
+          // payout_broadcasts.lastError column + the structured log.
+          deps.logger.warn("admin /payouts/:id/bump-fee error", {
+            payoutId: id,
+            code: err.code,
+            message: err.message
+          });
+          const safeMessage =
+            err.code === "BROADCAST_FAILED"
+              ? "Relay rejected the replacement transaction. Check payout_broadcasts.last_error for the full upstream message."
+              : err.message;
+          return c.json(
+            { error: { code: err.code, message: safeMessage } },
+            statusByCode[err.code] as 400 | 404 | 409 | 422 | 500 | 502
+          );
+        }
+        throw err;
+      }
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
   // Runtime migration apply. Node/Deno already run migrations at boot — this
   // endpoint is the same set, exposed for (a) the ops panel's "reapply"
   // button and (b) restarting a Node worker after a hot-patch of the
@@ -1880,8 +1956,8 @@ const hasFeeWallet = poolFamilies.has(
   // broadcasts via the Tron adapter's signAndBroadcast, reusing the same
   // signing path production payouts already go through.
 
-  async function resolveTronOps(c: import("hono").Context): Promise<
-    | { kind: "ok"; adapter: ReturnType<typeof findChainAdapter> & { tronBackend(chainId: number): ReturnType<ReturnType<typeof findChainAdapter>["getBalance"]> extends infer _ ? import("../../adapters/chains/tron/tron-rpc.js").TronRpcBackend : never }; feeWallet: { address: string } }
+  async function resolveTronOps(c: Context): Promise<
+    | { kind: "ok"; adapter: ReturnType<typeof findChainAdapter> & { tronBackend(chainId: number): TronRpcBackend }; feeWallet: { address: string } }
     | { kind: "error"; response: Response }
   > {
     // Fee wallet must be registered for this family.
@@ -1918,7 +1994,7 @@ const hasFeeWallet = poolFamilies.has(
     }
     return {
       kind: "ok",
-      adapter: adapter as unknown as ReturnType<typeof findChainAdapter> & { tronBackend(chainId: number): import("../../adapters/chains/tron/tron-rpc.js").TronRpcBackend },
+      adapter: adapter as unknown as ReturnType<typeof findChainAdapter> & { tronBackend(chainId: number): TronRpcBackend },
       feeWallet: { address: rec.address }
     };
   }
@@ -1955,10 +2031,10 @@ const hasFeeWallet = poolFamilies.has(
     // with the same shape buildTransfer emits. No feePayer is involved —
     // these admin ops always sign with a single key (the fee wallet's).
     const unsigned = {
-      chainId: TRON_MAINNET_CHAIN_ID as unknown as import("../../core/types/chain.js").ChainId,
+      chainId: TRON_MAINNET_CHAIN_ID as unknown as ChainId,
       raw: unsignedRaw,
       summary: "tron-admin-op"
-    } as import("../../core/types/unsigned-tx.js").UnsignedTx;
+    } as UnsignedTx;
     const privateKey = await deps.signerStore.get({ kind: "fee-wallet", family: "tron" });
     return adapter.signAndBroadcast(unsigned, privateKey);
   }
@@ -2139,7 +2215,7 @@ const hasFeeWallet = poolFamilies.has(
 // Local alias to narrow the adapter type once `isTronChainAdapter` has
 // already confirmed the shape. Referenced from `signAndBroadcastTronRaw`.
 type TronChainAdapterRet = ReturnType<typeof findChainAdapter> & {
-  tronBackend(chainId: number): import("../../adapters/chains/tron/tron-rpc.js").TronRpcBackend;
+  tronBackend(chainId: number): TronRpcBackend;
 };
 
 const InitializePoolSchema = z.object({

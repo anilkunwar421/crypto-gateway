@@ -40,6 +40,9 @@ export interface ScheduledJobsResult {
   // (`deps.alchemy` set). Absent otherwise — callers should not treat the
   // missing key as a failure.
   alchemySyncAddresses?: JobOutcome;
+  // Present only when BlockCypher is configured (`deps.blockcypher` set).
+  // Drains the `blockcypher_subscriptions` queue per tick.
+  blockcypherSyncSubscriptions?: JobOutcome;
 }
 
 export type JobOutcome = { ok: true; value: unknown } | { ok: false; error: string };
@@ -69,6 +72,9 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
   };
   if (deps.alchemy !== undefined) {
     result.alchemySyncAddresses = await run(() => deps.alchemy!.syncAddresses());
+  }
+  if (deps.blockcypher !== undefined) {
+    result.blockcypherSyncSubscriptions = await run(() => deps.blockcypher!.syncSubscriptions());
   }
   return result;
 }

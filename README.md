@@ -361,12 +361,14 @@ registered for that chainId).
 | Tron Nile (testnet) | 3448148188 | TRX | USDT |
 | Solana mainnet | 900 | SOL | USDC, USDT |
 | Solana devnet | 901 | SOL | — |
+| Bitcoin | 800 | BTC | — |
+| Litecoin | 801 | LTC | — |
 
 Notes:
 - **Decimals differ.** Most stables are 6 decimals; BNB-chain USDC/USDT are
   18; native gas is 18 for all EVM chains, 6 for TRX (sun), 9 for SOL
-  (lamports). Always quote against the per-token `decimals` from
-  `/admin/chains` — never assume 6.
+  (lamports), 8 for BTC/LTC (satoshis). Always quote against the per-token
+  `decimals` from `/admin/chains` — never assume 6.
 - **Universal acceptance via `amountUSD`.** A USD-pegged invoice can be paid
   in **any combination** of registered tokens at the same address. Each
   transfer's USD value is computed at detection time via the rate snapshot
@@ -378,6 +380,83 @@ Notes:
   (`/v1/accounts/{addr}/transactions`); Alchemy's Tron RPC has no indexed
   address-history endpoints. Outbound (payouts) works through either
   TronGrid or Alchemy.
+- **UTXO chains (BTC + LTC)** use a fundamentally different model from the
+  account-model EVM/Tron/Solana adapters — see the UTXO section below.
+
+## UTXO chains (Bitcoin + Litecoin)
+
+UTXO chains are first-class but architecturally distinct from the account
+model. Key differences merchants should know about:
+
+**Address derivation — BIP84 native segwit.** Every BTC/LTC invoice gets a
+**fresh address** derived from the gateway's `MASTER_SEED` at a
+monotonically-incremented index:
+
+| Chain | Path | Address format | HRP |
+| --- | --- | --- | --- |
+| Bitcoin (chainId 800) | `m/84'/0'/0'/0/N` | `bc1q…` (P2WPKH) | `bc` |
+| Litecoin (chainId 801) | `m/84'/2'/0'/0/N` | `ltc1q…` (P2WPKH) | `ltc` |
+
+The same seed produces identical addresses in Electrum, Sparrow, Ledger
+Live, Trezor Suite, and any other BIP84-compliant wallet. Verified against
+the BIP84 reference vector (`abandon×11 about` mnemonic →
+`bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu`).
+
+**No address pool.** EVM/Tron/Solana invoices share a pool of pre-derived
+addresses with cooldown-based reuse. UTXO chains skip the pool entirely:
+
+- BIP84 derivation is cheap (one secp256k1 → bech32 round-trip).
+- UTXO privacy heuristics actively penalize address reuse — a pool would
+  link multiple invoices to the same address visible on-chain explorers.
+- The `address_index_counters` table tracks the next index per chain;
+  `POST /invoices` atomically increments it and stores the derived address
+  on the invoice row.
+- `invoice_receive_addresses.poolAddressId` is **NULL** for UTXO invoices
+  (the column exists for EVM/Tron/Solana pool linkage).
+
+**Detection — Esplora REST.** Mempool.space + Blockstream public APIs serve
+all detection traffic. No API key required. Adapters fail over between
+backends; if all are down, payments queue in the next poll cycle.
+
+**Local UTXO ledger.** A `utxos` table mirrors the on-chain UTXO set for
+addresses we own:
+- One row per output that paid one of our addresses, with FK to the
+  source `transactions` row (`transaction_id`).
+- Carries `script_pubkey` + `address_index` for sign-time key derivation.
+- `spent_in_payout_id` flips when a payout consumes the UTXO.
+- Coin selection is **a single indexed DB query** instead of N HTTP calls
+  to Esplora.
+
+**Payouts — coin selection across all owned UTXOs.** When a merchant
+requests a BTC/LTC payout:
+1. `planPayout` verifies aggregate confirmed-and-unspent UTXO balance ≥
+   `amountRaw + estimated fee` (no per-source picker; UTXO has no concept
+   of "the source address").
+2. Executor runs the npm `coinselect` package (branch-and-bound + largest-
+   first fallback) to pick optimal inputs.
+3. Each input is signed with the private key derived from its
+   `addressIndex` via BIP143 sighash + RFC 6979 ECDSA + DER + low-s
+   normalization.
+4. Change (when needed) goes to a fresh BIP84 address from the same
+   counter — never reused.
+5. Tx broadcasts via Esplora `POST /tx`; the returned txid is cross-
+   checked against the locally-computed value to surface any
+   server-side reserialization.
+
+**Confirmation thresholds.** Configurable via `FINALITY_OVERRIDES`; defaults:
+
+- Bitcoin (chainId 800): **6 confirmations** (~60 minutes at 10-min blocks)
+- Litecoin (chainId 801): **12 confirmations** (~30 minutes at 2.5-min blocks)
+
+**Out of scope for v1** (deferred to follow-ups):
+
+- Testnet support (BTC testnet3 / signet, LTC testnet)
+- RBF (replace-by-fee) for stuck payouts
+- Address types other than native segwit (legacy `1…`, P2SH-segwit `3…`,
+  taproot `bc1p…`)
+- BlockCypher push-detection accelerator (planned; system works correctly
+  on Esplora poll alone)
+- Lightning Network
 
 ## Multi-family invoice acceptance
 

@@ -967,6 +967,34 @@
               "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
+              "name": "Bitcoin — BTC (0.001 BTC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 800,\n  \"token\": \"BTC\",\n  \"amountRaw\": \"100000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Bitcoin mainnet (chainId 800). Native segwit (bech32) addresses derived via BIP84 m/84'/0'/0'/0/N — fresh per invoice (no pool), privacy-preserving. Detection via Esplora REST (mempool.space + Blockstream public APIs, no key required). Payouts coin-select across all owned UTXOs at broadcast time."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Litecoin — LTC (0.01 LTC)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 801,\n  \"token\": \"LTC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Litecoin mainnet (chainId 801). BIP84 m/84'/2'/0'/0/N → ltc1q… addresses. Same Esplora-based detection + coinselect-based payouts as Bitcoin; differs only in coin_type and bech32 HRP."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
               "name": "Dev chain — DEV (1 DEV)",
               "request": {
                 "method": "POST",
@@ -1130,6 +1158,38 @@
               "raw": "{\n  \"chainId\": 728126428,\n  \"token\": \"TRX\",\n  \"amountUSD\": \"5.00\",\n  \"destinationAddress\": \"TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7\"\n}"
             },
             "description": "Sends $5 worth of native TRX on Tron mainnet. The price oracle resolves TRX/USD at create time; the resolved rate is snapshotted on the row as `quotedRate` (e.g. `\"0.25\"` for $0.25 per TRX → ~20 TRX). Note: TRX is volatile, so the actual broadcast value may drift slightly from $5 by the time the cron picks it up. Oracle outage → 503 `ORACLE_FAILED`."
+          }
+        },
+        {
+          "name": "Plan native payout — Bitcoin BTC (sats)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 800,\n  \"token\": \"BTC\",\n  \"amountRaw\": \"50000\",\n  \"destinationAddress\": \"bc1q...\"\n}"
+            },
+            "description": "Sends 50_000 sats (0.0005 BTC) to a P2WPKH bech32 destination. UTXO chains differ from account-model payouts: there's no single source address — `planPayout` verifies the aggregate confirmed-and-unspent UTXO balance covers `amountRaw + estimated fee`, then the executor's `broadcastUtxoMain` runs `coinselect` across all owned UTXOs at broadcast time. Change (when the picked inputs exceed `amountRaw + fee`) goes to a fresh BIP84 address — never reused. Destinations must be native segwit (`bc1q…`); legacy and P2SH-segwit destinations aren't supported in v1."
+          }
+        },
+        {
+          "name": "Plan native payout — Litecoin LTC (litoshi)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 801,\n  \"token\": \"LTC\",\n  \"amountRaw\": \"500000\",\n  \"destinationAddress\": \"ltc1q...\"\n}"
+            },
+            "description": "Sends 500_000 litoshi (0.005 LTC) to a P2WPKH bech32 destination. Same flow as Bitcoin (BIP84, coinselect, segwit signing); HRP `ltc` instead of `bc`."
           }
         },
         {

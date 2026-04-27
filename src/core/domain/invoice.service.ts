@@ -732,7 +732,15 @@ function familyHasToken(family: ChainFamily, token: string): boolean {
 // Small helper mapping chain ids to their families. Mirrors the adapter's
 // family property without requiring an adapter lookup — the token registry
 // is already loaded in memory, and we only need the family label.
+//
+// chainId ranges:
+//   - 800-899  : utxo (800=BTC, 801=LTC; reserved for testnets/other UTXO chains)
+//   - 900-901  : solana (mainnet, devnet)
+//   - 728126428, 3448148188 : tron (mainnet, Nile testnet)
+//   - everything else : evm (Ethereum, Polygon, BSC, Arbitrum, Base, Optimism,
+//                            Avalanche, Sepolia, dev chain 999)
 function familyForChainId(chainId: number): ChainFamily | null {
+  if (chainId >= 800 && chainId <= 899) return "utxo";
   if (chainId >= 900 && chainId <= 901) return "solana";
   if (chainId === 728126428 || chainId === 3448148188) return "tron";
   return "evm";

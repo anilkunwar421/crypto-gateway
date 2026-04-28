@@ -1811,7 +1811,11 @@ async function broadcastUtxoMain(
       const pk = await deps.signerStore.get({
         kind: "pool-address",
         family: "utxo",
-        derivationIndex: u.addressIndex
+        derivationIndex: u.addressIndex,
+        // chainId disambiguates the per-chain adapter (BTC vs LTC vs testnets)
+        // — without it the signer falls back to first-by-family and returns
+        // a key derived at the wrong BIP44 coin_type.
+        chainId: row.chainId as ChainId
       });
       inputPrivateKeys.push({ address: u.address as Address, privateKey: pk });
     }

@@ -82,14 +82,28 @@ export interface HdSignerStoreOptions {
 export function hdSignerStore(opts: HdSignerStoreOptions): SignerStore {
   const { masterSeed, chains, feeWalletStore, secretsCipher, db } = opts;
 
-  // First adapter per family wins. Different chainIds in the same family share
-  // the same derivation (EVM pubkeys are identical across all 7 EVM chains, and
-  // SLIP-0010 for Solana / BIP44 for Tron are single-curve per family), so
-  // picking the first is correct regardless of which chainId the caller has.
+  // Two indexes over `chains`:
+  //   - adapterByFamily: first adapter per family wins. Correct for account-
+  //     model families (EVM/Tron/Solana) where every chainId in the family
+  //     shares one derivation curve + path (EVM pubkeys are identical across
+  //     7 chains, SLIP-0010 single-curve for Solana, BIP44 single-coin for
+  //     Tron). Used when scope.chainId is absent OR when the family has only
+  //     one adapter registered.
+  //   - adapterByChainId: every chainId an adapter advertises in
+  //     `supportedChainIds` maps to that adapter. Required for UTXO where
+  //     each chain has its OWN adapter with chain-specific BIP44 coin_type
+  //     (BTC=0, LTC=2, testnets=1). Picking by family alone returned the
+  //     first-registered UTXO adapter (BTC) for every UTXO chain and produced
+  //     wrong-coin-type private keys; signing then failed at the
+  //     hash160 cross-check inside signSegwitTx.
   const adapterByFamily = new Map<ChainFamily, ChainAdapter>();
+  const adapterByChainId = new Map<number, ChainAdapter>();
   for (const adapter of chains) {
     if (!adapterByFamily.has(adapter.family)) {
       adapterByFamily.set(adapter.family, adapter);
+    }
+    for (const cid of adapter.supportedChainIds) {
+      adapterByChainId.set(cid, adapter);
     }
   }
 
@@ -97,6 +111,30 @@ export function hdSignerStore(opts: HdSignerStoreOptions): SignerStore {
     const adapter = adapterByFamily.get(family);
     if (!adapter) throw new NoAdapterForFamilyError(family);
     return adapter;
+  }
+
+  // Resolve adapter for a pool-address scope: prefer chainId-keyed lookup
+  // (correct for multi-adapter families like UTXO), fall back to family for
+  // legacy callers that don't pass chainId. Chain-mismatch (chainId
+  // registered to a different family than scope.family) throws — protects
+  // against mis-routed scopes that would otherwise silently sign with the
+  // wrong key.
+  function resolvePoolAddressAdapter(family: ChainFamily, chainId: number | undefined): ChainAdapter {
+    if (chainId !== undefined) {
+      const byChain = adapterByChainId.get(chainId);
+      if (!byChain) {
+        throw new Error(
+          `hdSignerStore: no chain adapter registered for chainId=${chainId} (scope.family='${family}')`
+        );
+      }
+      if (byChain.family !== family) {
+        throw new Error(
+          `hdSignerStore: chainId=${chainId} belongs to family='${byChain.family}' but scope.family='${family}'`
+        );
+      }
+      return byChain;
+    }
+    return requireAdapter(family);
   }
 
   async function resolvePrivateKey(scope: SignerScope): Promise<string> {
@@ -179,7 +217,10 @@ export function hdSignerStore(opts: HdSignerStoreOptions): SignerStore {
     // pool-address — derive at the supplied index directly. Every HD-derived
     // payout source (pool receive addresses, top-up sponsors) flows through
     // this arm; the caller looks up `addressPool.addressIndex` before signing.
-    const adapter = requireAdapter(scope.family);
+    // For UTXO chains the caller MUST set scope.chainId so we pick the BTC
+    // vs LTC vs testnet adapter (each has its own BIP44 coin_type). EVM/Tron/
+    // Solana ignore chainId since one adapter per family handles all chainIds.
+    const adapter = resolvePoolAddressAdapter(scope.family, scope.chainId);
     const { privateKey } = adapter.deriveAddress(masterSeed, scope.derivationIndex);
     return privateKey;
   }

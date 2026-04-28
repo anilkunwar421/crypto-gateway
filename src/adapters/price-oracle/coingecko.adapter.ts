@@ -60,6 +60,8 @@ export const COINGECKO_DEFAULT_SYMBOL_MAP: Readonly<Record<string, string>> = {
   AVAX: "avalanche-2",
   SOL: "solana",
   TRX: "tron",
+  BTC: "bitcoin",
+  LTC: "litecoin",
   // Stablecoins
   USDC: "usd-coin",
   USDT: "tether",

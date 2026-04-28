@@ -376,7 +376,11 @@ export async function bumpPayoutFee(
     const pk = await deps.signerStore.get({
       kind: "pool-address",
       family: "utxo",
-      derivationIndex: u.addressIndex
+      derivationIndex: u.addressIndex,
+      // chainId disambiguates per-chain UTXO adapters (BTC/LTC/testnets) —
+      // each uses a different BIP44 coin_type. Same fix as the initial-
+      // broadcast path in payout.service.ts.
+      chainId: row.chainId as ChainId
     });
     inputPrivateKeys.push({ address: u.address as Address, privateKey: pk });
   }

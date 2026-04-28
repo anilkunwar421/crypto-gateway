@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ChainFamilySchema } from "./chain.js";
+import { ChainFamilySchema, ChainIdSchema } from "./chain.js";
 
 // Scope keys for the SignerStore.
 //
@@ -23,7 +23,16 @@ export const SignerScopeSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("pool-address"),
     family: ChainFamilySchema,
-    derivationIndex: z.number().int().nonnegative()
+    derivationIndex: z.number().int().nonnegative(),
+    // Optional chainId — required for families where multiple chain adapters
+    // share the same `family` value AND have chain-specific derivation paths
+    // (UTXO: BTC uses BIP44 coin_type=0, LTC uses 2; testnets use 1).
+    // Account-model families (EVM/Tron/Solana) register a single adapter per
+    // family that handles every chainId, so the chainId is irrelevant for
+    // their derivation and can be omitted. Omitting it on UTXO falls back to
+    // first-adapter-by-family — wrong key, signing fails — so callers in the
+    // UTXO path MUST set it.
+    chainId: ChainIdSchema.optional()
   }),
   z.object({ kind: z.literal("sweep-master"), family: ChainFamilySchema }),
   z.object({ kind: z.literal("receive-hd") }),

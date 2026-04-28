@@ -2,7 +2,7 @@ import { z } from "zod";
 import { and, asc, desc, eq, gte, inArray, isNotNull, lte, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily } from "../types/chain.js";
-import { chainSlug } from "../types/chain-registry.js";
+import { chainEntry, chainSlug } from "../types/chain-registry.js";
 import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema, formatRawAmount } from "../types/money.js";
 import { MerchantIdSchema, PaymentToleranceBpsSchema } from "../types/merchant.js";
 import type { Invoice, InvoiceId, InvoiceReceiveAddress } from "../types/invoice.js";
@@ -202,11 +202,33 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   // get released the same way as full ones.
   try {
     for (const family of familyOrder) {
-      const familyAdapter = deps.chains.find((c) => c.family === family);
+      // Pick the right adapter for this family.
+      //   - PRIMARY family (the invoice's `chainId`): use the chain-specific
+      //     adapter resolved by chainId. This matters for UTXO where each
+      //     chain has its OWN adapter (BTC vs LTC vs testnets) — `family
+      //     === "utxo"` matches multiple adapters; only the chainId
+      //     disambiguates them. Picking by family alone returned the
+      //     first-registered UTXO adapter (BTC) for every UTXO invoice and
+      //     produced wrong-HRP addresses (e.g. `bc1q…` for a chainId=801
+      //     Litecoin invoice).
+      //   - NON-PRIMARY families (multi-family invoices, e.g. evm+tron+solana):
+      //     EVM/Tron/Solana register one adapter per family that handles
+      //     every chainId in that family, so picking by family is correct.
+      //     Using a UTXO chain as a non-primary family of a non-UTXO invoice
+      //     isn't a supported shape today (we'd need an explicit per-family
+      //     chainId in the request) — surface as an error.
+      const familyAdapter =
+        family === primaryFamily
+          ? primaryChainAdapter
+          : family === "utxo"
+            ? null
+            : deps.chains.find((c) => c.family === family);
       if (!familyAdapter) {
         throw new InvoiceError(
           "TOKEN_NOT_SUPPORTED",
-          `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
+          family === "utxo"
+            ? "UTXO can only appear as the primary family of a UTXO invoice. Non-primary UTXO acceptance requires per-family chainId selection, which isn't supported yet."
+            : `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
         );
       }
       // UTXO family bypasses the address pool entirely — privacy heuristics on
@@ -729,21 +751,14 @@ function familyHasToken(family: ChainFamily, token: string): boolean {
   return false;
 }
 
-// Small helper mapping chain ids to their families. Mirrors the adapter's
-// family property without requiring an adapter lookup — the token registry
-// is already loaded in memory, and we only need the family label.
-//
-// chainId ranges:
-//   - 800-899  : utxo (800=BTC, 801=LTC; reserved for testnets/other UTXO chains)
-//   - 900-901  : solana (mainnet, devnet)
-//   - 728126428, 3448148188 : tron (mainnet, Nile testnet)
-//   - everything else : evm (Ethereum, Polygon, BSC, Arbitrum, Base, Optimism,
-//                            Avalanche, Sepolia, dev chain 999)
+// Authoritative chainId → family lookup via the chain registry. The previous
+// hardcoded copy lived here AND in rate-window.ts, and the two drifted: the
+// rate-window copy lacked the UTXO branch and routed BTC/LTC chainIds to
+// "evm" via a `chainId > 0` catch-all, breaking USD-path invoices on UTXO
+// chains. Both files now route through `chainEntry()` so a future chain
+// addition needs to touch CHAIN_REGISTRY only.
 function familyForChainId(chainId: number): ChainFamily | null {
-  if (chainId >= 800 && chainId <= 899) return "utxo";
-  if (chainId >= 900 && chainId <= 901) return "solana";
-  if (chainId === 728126428 || chainId === 3448148188) return "tron";
-  return "evm";
+  return chainEntry(chainId)?.family ?? null;
 }
 
 // ---- Typed domain error ----

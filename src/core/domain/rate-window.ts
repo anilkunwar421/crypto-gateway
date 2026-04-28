@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainFamily } from "../types/chain.js";
+import { chainEntry } from "../types/chain-registry.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
 import type { TokenSymbol } from "../types/token.js";
 import { invoices } from "../../db/schema.js";
@@ -55,6 +56,14 @@ export function tokensForFamilies(families: readonly ChainFamily[]): readonly To
   }
   if (families.includes("solana")) {
     set.add("SOL");
+  }
+  if (families.includes("utxo")) {
+    // BTC + LTC are already in the registry (chainIds 800/801/802/803) so the
+    // loop above adds them, but stating them explicitly here matches the
+    // EVM/Tron/Solana branches and prevents a future registry refactor from
+    // silently dropping UTXO natives from the rate snapshot.
+    set.add("BTC");
+    set.add("LTC");
   }
   return Array.from(set) as TokenSymbol[];
 }
@@ -249,12 +258,13 @@ export function subUsd(a: string, b: string): string {
   return `${dollars}.${cents.toString().padStart(2, "0")}`;
 }
 
-// Local copy of familyForChainId (invoice.service has one too — keeping a
-// dependency-free helper here avoids cycles). Both must agree.
+// Authoritative chainId → family lookup via the chain registry. The previous
+// local copy hardcoded family ranges and went stale: it had a `chainId > 0
+// → "evm"` catch-all that incorrectly swallowed UTXO chainIds (800/801/802/803),
+// so USD-path invoices for BTC/LTC produced an empty rate snapshot — payments
+// arrived with `usd_rate=null` and never credited the invoice's USD target.
+// chainEntry() pulls from CHAIN_REGISTRY, the same source-of-truth that
+// validateAddress / nativeSymbol / etc. all use. No drift possible.
 function familyForChainId(chainId: number): ChainFamily | null {
-  if (chainId >= 900 && chainId <= 901) return "solana";
-  if (chainId === 728126428 || chainId === 3448148188) return "tron";
-  if (chainId === 999) return "evm"; // dev chain
-  if (chainId > 0) return "evm"; // every real EVM chain id we support is > 0
-  return null;
+  return chainEntry(chainId)?.family ?? null;
 }

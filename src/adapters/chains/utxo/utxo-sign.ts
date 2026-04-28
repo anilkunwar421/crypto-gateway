@@ -78,10 +78,20 @@ export function signSegwitTx(
     // BIP143 sighash for this input.
     const sighash = bip143SighashP2wpkh(tx, i, pubkeyHash);
 
-    // Deterministic ECDSA (RFC 6979). @noble/curves v2 `sign()` returns a
-    // 64-byte Uint8Array (r || s, big-endian). Low-s normalization is the
-    // @noble default so we don't need to enforce it ourselves.
-    const rsRaw = secp256k1.sign(sighash, privBytes);
+    // Deterministic ECDSA (RFC 6979). @noble/curves v2 sign() returns a
+    // 64-byte Uint8Array (r || s, big-endian). Two non-default options
+    // matter here:
+    //   - `prehash: false` — `sighash` is the already-prepared 32-byte
+    //     BIP143 digest; without this, noble silently SHA256s it AGAIN
+    //     and produces a signature that's mathematically valid for
+    //     SHA256(sighash) but rejected on-chain as invalid for `sighash`
+    //     (Bitcoin Core surfaces it as `non-mandatory-script-verify-flag
+    //     (Signature must be zero for failed CHECK(MULTI)SIG operation)`,
+    //     i.e. BIP146 NULLFAIL).
+    //   - `lowS: true` — Bitcoin enforces low-S since BIP146; @noble
+    //     defaults to true but we set it explicitly so a future default
+    //     change can't silently break us.
+    const rsRaw = secp256k1.sign(sighash, privBytes, { prehash: false, lowS: true });
     const r = rsRaw.slice(0, 32);
     const s = rsRaw.slice(32, 64);
 

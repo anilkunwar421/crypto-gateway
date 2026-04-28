@@ -28,7 +28,9 @@ const DEFAULT_NATIVE_RATES: Readonly<Record<string, string>> = {
   POL: "0.60",
   AVAX: "30",
   SOL: "150",
-  TRX: "0.25"
+  TRX: "0.25",
+  BTC: "65000",
+  LTC: "85"
 };
 
 export function staticPegPriceOracle(config: StaticPegConfig = {}): PriceOracle {

@@ -60,14 +60,16 @@ export async function fetchInvoiceReceiveAddresses(
   const rows = await deps.db
     .select({
       family: invoiceReceiveAddresses.family,
+      chainId: invoiceReceiveAddresses.chainId,
       address: invoiceReceiveAddresses.address,
       poolAddressId: invoiceReceiveAddresses.poolAddressId
     })
     .from(invoiceReceiveAddresses)
     .where(eq(invoiceReceiveAddresses.invoiceId, invoiceId))
-    .orderBy(asc(invoiceReceiveAddresses.family));
+    .orderBy(asc(invoiceReceiveAddresses.family), asc(invoiceReceiveAddresses.chainId));
   return rows.map((r) => ({
     family: r.family as ChainFamily,
+    chainId: r.chainId,
     address: r.address as InvoiceReceiveAddress["address"],
     poolAddressId: r.poolAddressId
   }));

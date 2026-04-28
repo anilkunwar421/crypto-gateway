@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { and, asc, desc, eq, gte, inArray, isNotNull, lte, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
-import { ChainFamilySchema, ChainIdSchema, type ChainFamily } from "../types/chain.js";
+import { ChainFamilySchema, ChainIdSchema, type ChainFamily, type ChainId } from "../types/chain.js";
+import type { ChainAdapter } from "../ports/chain.port.js";
 import { chainEntry, chainSlug } from "../types/chain-registry.js";
 import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema, formatRawAmount } from "../types/money.js";
 import { MerchantIdSchema, PaymentToleranceBpsSchema } from "../types/merchant.js";
@@ -158,21 +159,45 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   // 4. Resolve the family set for this invoice.
   //      - `acceptedFamilies` explicit → exactly those families.
   //      - omitted → infer `[familyOf(chainId)]` (single-family legacy).
-  //    For each family in the set, validate the requested token is
-  //    registered on at least one of that family's chains — an invoice for
-  //    "USDC on Tron family" requires USDC on Tron mainnet (or Nile). If
-  //    none of a family's chains have the token, the invoice would be
-  //    unfulfillable on that family, so reject at creation time.
+  //
+  //    Token-availability validation depends on the pricing mode:
+  //
+  //    - LEGACY single-token (`amountRaw`, `fiatAmount + fiatCurrency`):
+  //      every accepted family must have the requested token registered,
+  //      because payments MUST come in that exact token. A family whose
+  //      chains don't carry the token is structurally unfulfillable.
+  //
+  //    - USD-pegged universal (`amountUsd`): payments in ANY token
+  //      registered on ANY accepted family count toward the USD target via
+  //      the rate-window snapshot. The `token` on the request is just a
+  //      display label for the invoice's primary chain; it doesn't need to
+  //      exist on every accepted family. We only require it on the PRIMARY
+  //      family (the one matching `chainId`) so the merchant's "primary
+  //      token on primary chain" assertion is at least coherent. Other
+  //      families can pay in their natives + stables freely.
   const primaryChainAdapter = findChainAdapter(deps, parsed.chainId);
   const acceptedFamilies: ChainFamily[] =
     parsed.acceptedFamilies ?? [primaryChainAdapter.family];
+  const isUsdPegged = parsed.amountUsd !== undefined;
 
-  for (const family of acceptedFamilies) {
-    if (!familyHasToken(family, parsed.token)) {
+  if (isUsdPegged) {
+    // Only the primary family needs the token. UTXO/Tron/Solana/etc. as
+    // non-primary accepted families don't need USDC (or whatever) — they'll
+    // accept their own natives + stables and convert to USD.
+    if (!familyHasToken(primaryChainAdapter.family, parsed.token)) {
       throw new InvoiceError(
         "TOKEN_NOT_SUPPORTED",
-        `Token ${parsed.token} is not registered on any chain in family '${family}'`
+        `Token ${parsed.token} is not registered on any chain in family '${primaryChainAdapter.family}' (the primary chain's family). USD-pegged invoices accept any token on any accepted family at the rate-window rate; the request's primary token must at least exist on the primary chain.`
       );
+    }
+  } else {
+    for (const family of acceptedFamilies) {
+      if (!familyHasToken(family, parsed.token)) {
+        throw new InvoiceError(
+          "TOKEN_NOT_SUPPORTED",
+          `Token ${parsed.token} is not registered on any chain in family '${family}'. Legacy single-token invoices (amountRaw / fiatAmount) require the token on every accepted family. Switch to USD-pegged (amountUsd) to accept any token across families.`
+        );
+      }
     }
   }
 
@@ -202,62 +227,72 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   // get released the same way as full ones.
   try {
     for (const family of familyOrder) {
-      // Pick the right adapter for this family.
-      //   - PRIMARY family (the invoice's `chainId`): use the chain-specific
-      //     adapter resolved by chainId. This matters for UTXO where each
-      //     chain has its OWN adapter (BTC vs LTC vs testnets) — `family
-      //     === "utxo"` matches multiple adapters; only the chainId
-      //     disambiguates them. Picking by family alone returned the
-      //     first-registered UTXO adapter (BTC) for every UTXO invoice and
-      //     produced wrong-HRP addresses (e.g. `bc1q…` for a chainId=801
-      //     Litecoin invoice).
-      //   - NON-PRIMARY families (multi-family invoices, e.g. evm+tron+solana):
-      //     EVM/Tron/Solana register one adapter per family that handles
-      //     every chainId in that family, so picking by family is correct.
-      //     Using a UTXO chain as a non-primary family of a non-UTXO invoice
-      //     isn't a supported shape today (we'd need an explicit per-family
-      //     chainId in the request) — surface as an error.
-      const familyAdapter =
-        family === primaryFamily
-          ? primaryChainAdapter
-          : family === "utxo"
-            ? null
-            : deps.chains.find((c) => c.family === family);
-      if (!familyAdapter) {
+      // Resolve the set of adapters to allocate addresses from for THIS family.
+      //
+      //   - EVM / Tron / Solana: one adapter per family handles every chainId,
+      //     and addresses are chain-agnostic across the family — so we
+      //     allocate exactly ONE address. The `chainId` recorded on the row
+      //     is the invoice's primary chainId (for the primary family) or a
+      //     conventional default (chainAdapter.supportedChainIds[0]) for
+      //     non-primary families.
+      //
+      //   - UTXO (primary): allocate one address on `parsed.chainId`'s chain
+      //     adapter exclusively. The merchant explicitly chose the chain.
+      //
+      //   - UTXO (non-primary on a non-UTXO-primary universal invoice):
+      //     allocate one address per REGISTERED UTXO chain (e.g. BTC + LTC
+      //     simultaneously, plus testnets if the deployment registers them).
+      //     Each lands as its own row keyed by `(invoice_id, family='utxo',
+      //     chain_id)`. This is the "$10 USD invoice payable in BTC OR LTC"
+      //     workflow — the customer picks which UTXO chain to pay on, the
+      //     gateway accepts whichever address gets funded first.
+      const adaptersForFamily = resolveAllocationAdaptersForFamily({
+        family,
+        primaryFamily,
+        primaryChainAdapter,
+        primaryChainId: parsed.chainId,
+        chains: deps.chains
+      });
+      if (adaptersForFamily.length === 0) {
         throw new InvoiceError(
           "TOKEN_NOT_SUPPORTED",
-          family === "utxo"
-            ? "UTXO can only appear as the primary family of a UTXO invoice. Non-primary UTXO acceptance requires per-family chainId selection, which isn't supported yet."
-            : `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
+          `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
         );
       }
-      // UTXO family bypasses the address pool entirely — privacy heuristics on
-      // Bitcoin/Litecoin require non-reuse, and BIP84 derivation is cheap, so
-      // each invoice mints a fresh address from the per-chain monotonic
-      // counter. EVM/Tron/Solana keep using the existing pool path.
-      let canonical: string;
-      let addressIndex: number;
-      let poolAddressId: string | null;
-      if (family === "utxo") {
-        const seed = deps.secrets.getRequired("MASTER_SEED");
-        const allocated = await allocateUtxoAddress(deps, familyAdapter, parsed.chainId, seed);
-        canonical = familyAdapter.canonicalizeAddress(allocated.address);
-        addressIndex = allocated.addressIndex;
-        poolAddressId = null;
-      } else {
-        const allocated = await allocateForInvoice(deps, invoiceId, family);
-        canonical = familyAdapter.canonicalizeAddress(allocated.address);
-        addressIndex = allocated.addressIndex;
-        poolAddressId = allocated.id;
-      }
-      receiveRows.push({
-        family,
-        address: canonical as InvoiceReceiveAddress["address"],
-        poolAddressId
-      });
-      if (family === primaryFamily) {
-        primaryAddress = canonical;
-        primaryAddressIndex = addressIndex;
+
+      for (const { adapter, chainId } of adaptersForFamily) {
+        // UTXO family bypasses the address pool entirely — privacy heuristics
+        // on Bitcoin/Litecoin require non-reuse, and BIP84 derivation is
+        // cheap, so each invoice mints a fresh address from the per-chain
+        // monotonic counter. EVM/Tron/Solana keep using the existing pool path.
+        let canonical: string;
+        let addressIndex: number;
+        let poolAddressId: string | null;
+        if (family === "utxo") {
+          const seed = deps.secrets.getRequired("MASTER_SEED");
+          const allocated = await allocateUtxoAddress(deps, adapter, chainId, seed);
+          canonical = adapter.canonicalizeAddress(allocated.address);
+          addressIndex = allocated.addressIndex;
+          poolAddressId = null;
+        } else {
+          const allocated = await allocateForInvoice(deps, invoiceId, family);
+          canonical = adapter.canonicalizeAddress(allocated.address);
+          addressIndex = allocated.addressIndex;
+          poolAddressId = allocated.id;
+        }
+        receiveRows.push({
+          family,
+          chainId,
+          address: canonical as InvoiceReceiveAddress["address"],
+          poolAddressId
+        });
+        // Only the PRIMARY family's primary chain populates the legacy
+        // denormalized columns. For UTXO-primary that's the chosen UTXO
+        // chain; for EVM/Tron/Solana primary it's parsed.chainId.
+        if (family === primaryFamily && chainId === parsed.chainId) {
+          primaryAddress = canonical;
+          primaryAddressIndex = addressIndex;
+        }
       }
     }
     if (primaryAddress === null) {
@@ -331,6 +366,7 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
       deps.db.insert(invoiceReceiveAddresses).values({
         invoiceId,
         family: rx.family,
+        chainId: rx.chainId,
         address: rx.address,
         poolAddressId: rx.poolAddressId,
         createdAt: now
@@ -516,17 +552,19 @@ async function hydrateInvoicesWithAddresses(
     .select({
       invoiceId: invoiceReceiveAddresses.invoiceId,
       family: invoiceReceiveAddresses.family,
+      chainId: invoiceReceiveAddresses.chainId,
       address: invoiceReceiveAddresses.address,
       poolAddressId: invoiceReceiveAddresses.poolAddressId
     })
     .from(invoiceReceiveAddresses)
     .where(inArray(invoiceReceiveAddresses.invoiceId, ids))
-    .orderBy(asc(invoiceReceiveAddresses.family));
+    .orderBy(asc(invoiceReceiveAddresses.family), asc(invoiceReceiveAddresses.chainId));
   const byInvoice = new Map<string, InvoiceReceiveAddress[]>();
   for (const r of addrRows) {
     const list = byInvoice.get(r.invoiceId) ?? [];
     list.push({
       family: r.family as ChainFamily,
+      chainId: r.chainId,
       address: r.address as InvoiceReceiveAddress["address"],
       poolAddressId: r.poolAddressId
     });
@@ -737,6 +775,67 @@ export async function sweepExpiredInvoices(deps: AppDeps): Promise<SweepExpiredI
     }
   }
   return { expired: updated.length };
+}
+
+// Decide WHICH chain adapter(s) — and which chainId(s) — to allocate
+// receive addresses on for a single accepted family. Returns one entry per
+// (adapter, chainId) the loop should mint an address for.
+//
+//   - PRIMARY family: exactly one entry, on the request's `parsed.chainId`.
+//     Uses `primaryChainAdapter` directly so chainId-specific UTXO adapters
+//     (BTC vs LTC vs testnets) are routed correctly even though all share
+//     `family === "utxo"`.
+//
+//   - NON-PRIMARY EVM/Tron/Solana: one entry. Pick the first registered
+//     adapter for that family; record its `supportedChainIds[0]` as the
+//     chainId. EVM/Tron/Solana addresses are chain-agnostic across the
+//     family, so the chainId is informational (frontends use it for label
+//     rendering), not authoritative.
+//
+//   - NON-PRIMARY UTXO: ONE ENTRY PER REGISTERED UTXO CHAIN. BTC and LTC
+//     (and any future DASH/DOGE) have structurally different addresses, so
+//     a "I accept UTXO" universal invoice yields one row per chain the
+//     deployment can serve. Customer picks their wallet's chain at payment
+//     time. Sorted by chainId for deterministic order.
+interface AllocationTarget {
+  readonly adapter: ChainAdapter;
+  readonly chainId: ChainId;
+}
+function resolveAllocationAdaptersForFamily(args: {
+  family: ChainFamily;
+  primaryFamily: ChainFamily;
+  primaryChainAdapter: ChainAdapter;
+  primaryChainId: ChainId;
+  chains: readonly ChainAdapter[];
+}): readonly AllocationTarget[] {
+  if (args.family === args.primaryFamily) {
+    return [{ adapter: args.primaryChainAdapter, chainId: args.primaryChainId }];
+  }
+  if (args.family === "utxo") {
+    // Every registered UTXO adapter, sorted by its primary supported
+    // chainId. De-duped on chainId so a deployment that wires the same
+    // chain twice doesn't double-allocate.
+    const seen = new Set<number>();
+    const targets: AllocationTarget[] = [];
+    for (const adapter of args.chains) {
+      if (adapter.family !== "utxo") continue;
+      for (const cid of adapter.supportedChainIds) {
+        if (seen.has(cid)) continue;
+        seen.add(cid);
+        targets.push({ adapter, chainId: cid as ChainId });
+      }
+    }
+    targets.sort((a, b) => a.chainId - b.chainId);
+    return targets;
+  }
+  // EVM / Tron / Solana — single adapter handles all chainIds in the
+  // family. Take the first match and record its first supported chainId
+  // as the row's `chain_id` (informational).
+  const adapter = args.chains.find((c) => c.family === args.family);
+  if (adapter === undefined) return [];
+  const firstChainId = adapter.supportedChainIds[0];
+  if (firstChainId === undefined) return [];
+  return [{ adapter, chainId: firstChainId as ChainId }];
 }
 
 // Returns true when at least one chain in the family has `token` registered.

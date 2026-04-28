@@ -26,6 +26,7 @@ function fixtureInvoice(overrides: Partial<Invoice> = {}): Invoice {
     receiveAddresses: [
       {
         family: "evm",
+        chainId: 1,
         address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" as never,
         poolAddressId: "00000000-0000-0000-0000-0000000000f0"
       }

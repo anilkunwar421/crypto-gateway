@@ -776,6 +776,17 @@ export const invoiceReceiveAddresses = sqliteTable(
       .notNull()
       .references(() => invoices.id),
     family: text("family", { enum: ["evm", "tron", "solana", "utxo"] }).notNull(),
+    // chainId of THIS specific receive address. For account-model families
+    // (EVM/Tron/Solana) where a single address is valid across every chain
+    // in the family, this is set to the invoice's primary chainId — purely
+    // informational, mostly used by frontends to render the chain label.
+    // For UTXO families where each chain has its OWN address shape (BTC
+    // bc1q…, LTC ltc1q…, testnets tb1q…/tltc1q…), this is the specific
+    // chainId the address derives for. A multi-UTXO universal invoice
+    // (`acceptedFamilies` includes "utxo" and the deployment registers
+    // both BTC + LTC adapters) writes ONE row per UTXO chain with this
+    // column distinguishing them.
+    chainId: integer("chain_id").notNull(),
     address: text("address").notNull(),
     // Pool-allocated address: NOT NULL on EVM / Tron / Solana invoices (every
     // receive address comes from `address_pool`). NULL on UTXO invoices —
@@ -787,7 +798,9 @@ export const invoiceReceiveAddresses = sqliteTable(
     createdAt: integer("created_at").notNull()
   },
   (t) => [
-    primaryKey({ columns: [t.invoiceId, t.family] }),
+    // PK now (invoice_id, family, chain_id) so multi-UTXO invoices can have
+    // BTC + LTC rows under family='utxo' simultaneously.
+    primaryKey({ columns: [t.invoiceId, t.family, t.chainId] }),
     index("idx_invoice_rx_address").on(t.address),
     index("idx_invoice_rx_pool").on(t.poolAddressId),
     check("invoice_rx_family_check", sql`${t.family} IN ('evm','tron','solana','utxo')`)

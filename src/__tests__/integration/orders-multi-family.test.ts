@@ -123,6 +123,103 @@ describe("POST /api/v1/invoices — multi-family acceptance", () => {
     expect(body.error.code).toBe("TOKEN_NOT_SUPPORTED");
   });
 
+  it("USD-pegged universal invoice with UTXO yields BOTH BTC and LTC addresses (one row per UTXO chain)", async () => {
+    // Pre-fix path 1: the per-family TOKEN_NOT_SUPPORTED check fired
+    // because USDC isn't on UTXO chains → 400.
+    // Pre-fix path 2: UTXO-as-non-primary picked ONE default UTXO chain
+    // (BTC) → only one bc1q… address.
+    // Post-fix: USD-pegged universal invoices skip the per-family token
+    // check (any token on any family converts via rate-window). For UTXO
+    // non-primary, we expand to one address PER REGISTERED UTXO CHAIN —
+    // so a deployment with both BTC and LTC adapters wired returns both
+    // bc1q… AND ltc1q… simultaneously. Customer picks their wallet's
+    // chain at payment time.
+    const { bitcoinChainAdapter, litecoinChainAdapter } = await import(
+      "../../adapters/chains/utxo/utxo-chain.adapter.js"
+    );
+    const allFamilyBoot = await bootTestApp({
+      chains: [
+        evmChainAdapter({ chainIds: [1], transports: { 1: noopTransport } }),
+        tronChainAdapter({
+          chainIds: [TRON_MAINNET_CHAIN_ID],
+          trongrid: { [TRON_MAINNET_CHAIN_ID]: { baseUrl: "https://unused.test" } }
+        }),
+        solanaChainAdapter({
+          chainIds: [SOLANA_MAINNET_CHAIN_ID],
+          rpc: { [SOLANA_MAINNET_CHAIN_ID]: { url: "http://unused.test/rpc" } }
+        }),
+        bitcoinChainAdapter(),
+        litecoinChainAdapter()
+      ],
+      poolInitialSize: 5
+    });
+    try {
+      const res = await allFamilyBoot.app.fetch(
+        new Request("http://test.local/api/v1/invoices", {
+          method: "POST",
+          headers: authHeader(allFamilyBoot.apiKeys[MERCHANT_ID]!),
+          body: JSON.stringify({
+            chainId: 1,
+            token: "USDC",
+            amountUsd: "10.00",
+            acceptedFamilies: ["evm", "tron", "solana", "utxo"],
+            expiresInMinutes: 30
+          })
+        })
+      );
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as {
+        invoice: {
+          acceptedFamilies: string[];
+          receiveAddresses: Array<{ family: string; chainId: number; address: string }>;
+        };
+      };
+      expect(body.invoice.acceptedFamilies.sort()).toEqual(["evm", "solana", "tron", "utxo"]);
+
+      // 5 receive addresses total: evm + tron + solana + utxo:BTC + utxo:LTC.
+      expect(body.invoice.receiveAddresses).toHaveLength(5);
+
+      // EVM/Tron/Solana stay one-row-per-family (addresses are chain-agnostic).
+      const evm = body.invoice.receiveAddresses.find((r) => r.family === "evm");
+      const tron = body.invoice.receiveAddresses.find((r) => r.family === "tron");
+      const sol = body.invoice.receiveAddresses.find((r) => r.family === "solana");
+      expect(evm?.chainId).toBe(1);
+      expect(tron?.chainId).toBe(TRON_MAINNET_CHAIN_ID);
+      expect(sol?.chainId).toBe(SOLANA_MAINNET_CHAIN_ID);
+
+      // UTXO expands to two rows — one per registered UTXO chain.
+      const utxoRows = body.invoice.receiveAddresses.filter((r) => r.family === "utxo");
+      expect(utxoRows).toHaveLength(2);
+      const btc = utxoRows.find((r) => r.chainId === 800);
+      const ltc = utxoRows.find((r) => r.chainId === 801);
+      expect(btc?.address.startsWith("bc1q")).toBe(true);
+      expect(ltc?.address.startsWith("ltc1q")).toBe(true);
+    } finally {
+      await allFamilyBoot.close();
+    }
+  });
+
+  it("USD-pegged invoice still rejects the FAKE primary token (sanity: only UTXO-as-non-primary is relaxed)", async () => {
+    // The relaxation only skips per-family checks for non-primary families.
+    // The PRIMARY chain's family must still have the requested token —
+    // catches typos / unregistered primary tokens.
+    const res = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: authHeader(apiKey),
+        body: JSON.stringify({
+          chainId: 1,
+          token: "FAKE",
+          amountUsd: "10.00",
+          acceptedFamilies: ["evm", "tron", "solana"]
+        })
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TOKEN_NOT_SUPPORTED");
+  });
+
   it("persists one row per family in invoice_receive_addresses", async () => {
     const res = await booted.app.fetch(
       new Request("http://test.local/api/v1/invoices", {

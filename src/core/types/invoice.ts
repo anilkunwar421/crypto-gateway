@@ -42,12 +42,29 @@ export type InvoiceExtraStatus = z.infer<typeof InvoiceExtraStatusSchema>;
 export const InvoiceIdSchema = z.string().uuid();
 export type InvoiceId = Brand<z.infer<typeof InvoiceIdSchema>, "InvoiceId">;
 
-// Per-family receive-address entry on an invoice. Multi-family invoices have
-// one row per accepted family (e.g. one EVM address + one Tron address).
-// Single-family invoices (legacy path) have exactly one entry, denormalized
-// into the invoice's `chainId` + `receiveAddress` columns for back-compat.
+// Per-family/per-chain receive-address entry on an invoice.
+//
+// Multi-family invoices have one row per accepted family for account-model
+// chains (one EVM address valid across all 7 EVM chains, one Tron address
+// across mainnet+Nile, etc.). UTXO is structurally different — BTC and
+// LTC have different address shapes — so a universal invoice that accepts
+// UTXO yields ONE row per UTXO chain the deployment supports
+// (`bc1q…` + `ltc1q…` simultaneously).
+//
+// `chainId` is informational on EVM/Tron/Solana rows (the address works on
+// every chainId in the family; we store the invoice's primary chainId so
+// frontends have a label) and authoritative on UTXO rows (each chainId
+// has its own derivation path → different addresses).
+//
+// Single-family invoices (legacy path) have one entry, denormalized into
+// the invoice's top-level `chainId` + `receiveAddress` columns for back-compat.
 export const InvoiceReceiveAddressSchema = z.object({
   family: ChainFamilySchema,
+  // Numeric chainId of the address. For EVM/Tron/Solana this matches the
+  // invoice's primary chainId (purely informational since the address is
+  // chain-agnostic in those families). For UTXO this is the specific chain
+  // (800/801/802/803) the address derives for.
+  chainId: z.number().int().positive(),
   address: AddressSchema,
   // NULL for UTXO-family receive addresses (no pool — fresh-per-invoice
   // derivation via address_index_counters). Non-null on EVM/Tron/Solana.

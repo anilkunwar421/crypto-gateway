@@ -4,7 +4,7 @@ import type { Address, ChainFamily, ChainId } from "../types/chain.js";
 import { formatRawAmount } from "../types/money.js";
 import type { TokenSymbol } from "../types/token.js";
 import { TOKEN_REGISTRY } from "../types/token-registry.js";
-import { addressPool, payoutReservations, payouts, transactions } from "../../db/schema.js";
+import { addressPool, payoutReservations, payouts, transactions, utxos } from "../../db/schema.js";
 
 // Admin balance snapshot.
 //
@@ -115,70 +115,69 @@ async function computeBalanceSnapshotDb(
   deps: AppDeps,
   opts: BalanceSnapshotOptions
 ): Promise<BalanceSnapshot> {
-  // 1. Load pool rows. Every gateway-controlled HD address lives here; the
-  //    snapshot has no other source.
+  // 1. Load pool rows. Account-model families (EVM/Tron/Solana) live in the
+  //    pool. UTXO bypasses the pool entirely — those balances come from the
+  //    dedicated UTXO branch below.
   const poolRows = await loadPoolRows(deps, opts);
   const poolAddressSet = new Set(poolRows.map((r) => r.address));
   const allAddresses = poolRows.map((r) => r.address);
 
-  if (allAddresses.length === 0) {
-    return {
-      generatedAt: deps.clock.now().toISOString(),
-      source: "db",
-      totalUsd: "0.00",
-      families: []
-    };
+  // 2. Confirmed inbound credits, scoped to our addresses. Skip the query
+  //    entirely when the pool is empty — `inArray(col, [])` is malformed SQL
+  //    and a no-row result anyway.
+  let creditRows: { address: string; chainId: number; token: string; amountRaw: string }[] = [];
+  let debitRows: { address: string | null; chainId: number; token: string; amountRaw: string }[] = [];
+  let reservationRows: { address: string; chainId: number; token: string; amountRaw: string }[] = [];
+  if (allAddresses.length > 0) {
+    const creditConds: SQL[] = [
+      eq(transactions.status, "confirmed"),
+      inArray(transactions.toAddress, allAddresses)
+    ];
+    if (opts.chainId !== undefined) creditConds.push(eq(transactions.chainId, opts.chainId));
+    creditRows = await deps.db
+      .select({
+        address: transactions.toAddress,
+        chainId: transactions.chainId,
+        token: transactions.token,
+        amountRaw: transactions.amountRaw
+      })
+      .from(transactions)
+      .where(and(...creditConds));
+
+    // 3. Confirmed outbound payouts. Every pool address is a candidate
+    //    source, so we apply this debit to ANY pool row that matches.
+    const debitConds: SQL[] = [
+      eq(payouts.status, "confirmed"),
+      sql`${payouts.sourceAddress} IS NOT NULL`
+    ];
+    if (opts.chainId !== undefined) debitConds.push(eq(payouts.chainId, opts.chainId));
+    debitRows = await deps.db
+      .select({
+        address: payouts.sourceAddress,
+        chainId: payouts.chainId,
+        token: payouts.token,
+        amountRaw: payouts.amountRaw
+      })
+      .from(payouts)
+      .where(and(...debitConds));
+
+    // 4. Active reservations (in-flight debits the operator should see as
+    //    "spoken for, not available to spend"). Same shape as debits.
+    const resConds: SQL[] = [
+      isNull(payoutReservations.releasedAt),
+      inArray(payoutReservations.address, allAddresses)
+    ];
+    if (opts.chainId !== undefined) resConds.push(eq(payoutReservations.chainId, opts.chainId));
+    reservationRows = await deps.db
+      .select({
+        address: payoutReservations.address,
+        chainId: payoutReservations.chainId,
+        token: payoutReservations.token,
+        amountRaw: payoutReservations.amountRaw
+      })
+      .from(payoutReservations)
+      .where(and(...resConds));
   }
-
-  // 2. Confirmed inbound credits, scoped to our addresses.
-  const creditConds: SQL[] = [
-    eq(transactions.status, "confirmed"),
-    inArray(transactions.toAddress, allAddresses)
-  ];
-  if (opts.chainId !== undefined) creditConds.push(eq(transactions.chainId, opts.chainId));
-  const creditRows = await deps.db
-    .select({
-      address: transactions.toAddress,
-      chainId: transactions.chainId,
-      token: transactions.token,
-      amountRaw: transactions.amountRaw
-    })
-    .from(transactions)
-    .where(and(...creditConds));
-
-  // 3. Confirmed outbound payouts. Every pool address is a candidate
-  //    source, so we apply this debit to ANY pool row that matches.
-  const debitConds: SQL[] = [
-    eq(payouts.status, "confirmed"),
-    sql`${payouts.sourceAddress} IS NOT NULL`
-  ];
-  if (opts.chainId !== undefined) debitConds.push(eq(payouts.chainId, opts.chainId));
-  const debitRows = await deps.db
-    .select({
-      address: payouts.sourceAddress,
-      chainId: payouts.chainId,
-      token: payouts.token,
-      amountRaw: payouts.amountRaw
-    })
-    .from(payouts)
-    .where(and(...debitConds));
-
-  // 4. Active reservations (in-flight debits the operator should see as
-  //    "spoken for, not available to spend"). Same shape as debits.
-  const resConds: SQL[] = [
-    isNull(payoutReservations.releasedAt),
-    inArray(payoutReservations.address, allAddresses)
-  ];
-  if (opts.chainId !== undefined) resConds.push(eq(payoutReservations.chainId, opts.chainId));
-  const reservationRows = await deps.db
-    .select({
-      address: payoutReservations.address,
-      chainId: payoutReservations.chainId,
-      token: payoutReservations.token,
-      amountRaw: payoutReservations.amountRaw
-    })
-    .from(payoutReservations)
-    .where(and(...resConds));
 
   // 5. Fold credits, debits, and reservations into per-(address, chainId)
   //    buckets. Negative results clamp to 0 — a negative would mean the
@@ -265,7 +264,104 @@ async function computeBalanceSnapshotDb(
     }
   }
 
+  // UTXO families don't use address_pool — fresh-per-invoice addresses.
+  // Spendability is the `utxos` table joined to confirmed parent transactions
+  // (this avoids the change-output undercount that an EVM-style
+  // transactions − payouts arithmetic would produce — change comes back to
+  // the same address as a NEW outpoint, and gross debits don't subtract it).
+  if (opts.family === undefined || opts.family === "utxo") {
+    await appendUtxoBalances(deps, opts, familyMap, usdRates);
+  }
+
   return materialize(familyMap, deps.clock.now().toISOString(), "db");
+}
+
+// ---- UTXO branch (db-mode) ----
+//
+// The `utxos` table is the spendability ledger for UTXO chains. Each row is a
+// confirmed output paid to one of our addresses; `spent_in_payout_id IS NULL`
+// means the coin is unspent. Sum unspent value per (chainId, address) and
+// emit one row per address, with the chain's native symbol resolved through
+// the chain adapter so multi-UTXO deployments (BTC + LTC) keep their correct
+// per-chain native (BTC=8 decimals, LTC=8 decimals — same scale, different
+// USD rates).
+async function appendUtxoBalances(
+  deps: AppDeps,
+  opts: BalanceSnapshotOptions,
+  familyMap: Map<ChainFamily, Map<ChainId, ChainAggregator>>,
+  poolUsdRates: Record<string, string>
+): Promise<void> {
+  const utxoAdapters = deps.chains.filter((a) => a.family === "utxo");
+  if (utxoAdapters.length === 0) return;
+
+  const conds: SQL[] = [
+    isNull(utxos.spentInPayoutId),
+    eq(transactions.status, "confirmed")
+  ];
+  if (opts.chainId !== undefined) conds.push(eq(utxos.chainId, opts.chainId));
+  if (opts.address !== undefined) conds.push(eq(utxos.address, opts.address));
+
+  const rows = await deps.db
+    .select({
+      chainId: utxos.chainId,
+      address: utxos.address,
+      valueSats: utxos.valueSats
+    })
+    .from(utxos)
+    .innerJoin(transactions, eq(utxos.transactionId, transactions.id))
+    .where(and(...conds));
+
+  if (rows.length === 0) return;
+
+  // (chainId, address) → sum(valueSats)
+  const sums = new Map<number, Map<string, bigint>>();
+  for (const r of rows) {
+    let byAddr = sums.get(r.chainId);
+    if (!byAddr) {
+      byAddr = new Map();
+      sums.set(r.chainId, byAddr);
+    }
+    byAddr.set(r.address, (byAddr.get(r.address) ?? 0n) + BigInt(r.valueSats));
+  }
+
+  // Resolve native symbol per chainId once, then collect any new symbols we
+  // need USD rates for (BTC / LTC) and merge into the rate map.
+  const nativeByChainId = new Map<number, TokenSymbol>();
+  const newSymbols = new Set<TokenSymbol>();
+  for (const adapter of utxoAdapters) {
+    for (const chainId of adapter.supportedChainIds) {
+      if (!sums.has(chainId)) continue;
+      const symbol = adapter.nativeSymbol(chainId);
+      nativeByChainId.set(chainId, symbol);
+      if (poolUsdRates[symbol] === undefined) newSymbols.add(symbol);
+    }
+  }
+  if (newSymbols.size > 0) {
+    const extra = await deps.priceOracle
+      .getUsdRates([...newSymbols])
+      .catch(() => ({} as Record<string, string>));
+    for (const [k, v] of Object.entries(extra)) poolUsdRates[k] = v;
+  }
+
+  for (const [chainId, byAddr] of sums) {
+    const symbol = nativeByChainId.get(chainId);
+    if (symbol === undefined) continue;
+    const agg = ensureAggregator(familyMap, "utxo", chainId as ChainId);
+    for (const [address, sats] of byAddr) {
+      pushAddressRow(
+        agg,
+        {
+          address,
+          kind: "pool",
+          poolStatus: "available",
+          poolAllocatedToInvoiceId: null
+        },
+        [{ token: symbol, amountRaw: sats }],
+        chainId as ChainId,
+        poolUsdRates
+      );
+    }
+  }
 }
 
 // Spendable balance for a single (chainId, address, token) tuple.
@@ -623,6 +719,31 @@ async function collectTargets(
         kind: "pool",
         poolStatus: row.status,
         poolAllocatedToInvoiceId: row.allocatedToInvoiceId
+      });
+    }
+  }
+
+  // UTXO addresses live in `utxos`, not `address_pool`. Enumerate the
+  // distinct (chainId, address) pairs that still hold unspent value so
+  // the live RPC reconciliation covers them too. Spent-out addresses are
+  // intentionally skipped — getAccountBalances would just return 0.
+  if (opts.family === undefined || opts.family === "utxo") {
+    const utxoConds: SQL[] = [isNull(utxos.spentInPayoutId)];
+    if (opts.chainId !== undefined) utxoConds.push(eq(utxos.chainId, opts.chainId));
+    if (opts.address !== undefined) utxoConds.push(eq(utxos.address, opts.address));
+    const utxoRows = await deps.db
+      .selectDistinct({ chainId: utxos.chainId, address: utxos.address })
+      .from(utxos)
+      .innerJoin(transactions, eq(utxos.transactionId, transactions.id))
+      .where(and(eq(transactions.status, "confirmed"), ...utxoConds));
+    for (const r of utxoRows) {
+      targets.push({
+        family: "utxo",
+        chainId: r.chainId as ChainId,
+        address: r.address,
+        kind: "pool",
+        poolStatus: "available",
+        poolAllocatedToInvoiceId: null
       });
     }
   }

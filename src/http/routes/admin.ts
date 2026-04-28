@@ -1758,7 +1758,7 @@ const hasFeeWallet = poolFamilies.has(
       if (familyParam !== undefined) {
         const f = ChainFamilySchema.safeParse(familyParam);
         if (!f.success) {
-          return c.json({ error: { code: "BAD_FAMILY", message: "family must be one of: evm, tron, solana" } }, 400);
+          return c.json({ error: { code: "BAD_FAMILY", message: "family must be one of: evm, tron, solana, utxo" } }, 400);
         }
         opts.family = f.data;
       }

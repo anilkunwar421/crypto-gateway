@@ -92,9 +92,15 @@ describe("solanaChainAdapter.scanIncoming", () => {
     const recipientAta = "3TPkxwzM4f5KqjyxcEui1QzdaBcDeFgHiJkLmNoPqRsTu";
     const senderAta = "9xAtaSenderABCdefGHIJKLMNOPQRSTUvwxYZ01234567";
 
+    // scanIncoming queries `getSignaturesForAddress` against the owner AND
+    // each owner-mint ATA derivation (otherwise SPL transfers — which only
+    // touch the recipient ATA in accountKeys — are invisible). We return
+    // the SAME signature to every caller; the adapter's dedupe ensures
+    // the underlying tx is fetched + parsed exactly once.
+    const calledAddresses: string[] = [];
     const client = fakeClient({
       async getSignaturesForAddress(address) {
-        expect(address).toBe(owner);
+        calledAddresses.push(address);
         return [
           {
             signature: "5o1QwXtrHJfJTXr4k73nnwLFSplCreditExampleSignature",
@@ -167,6 +173,8 @@ describe("solanaChainAdapter.scanIncoming", () => {
 
     // Exactly one USDC credit. The ATA-rent 2039280 lamports must NOT be
     // emitted because the credited index (recipientAta) is not `owner`.
+    // Also: the signature appeared via multiple targets (owner + USDC ATA
+    // + SOL ATA derivations) but dedupe yields a single transfer row.
     expect(transfers).toHaveLength(1);
     expect(transfers[0]).toMatchObject({
       chainId: SOLANA_MAINNET_CHAIN_ID,
@@ -179,6 +187,12 @@ describe("solanaChainAdapter.scanIncoming", () => {
       blockNumber: 414295300,
       confirmations: 1
     });
+    // The owner was scanned (for native SOL) AND the derived USDC ATA was
+    // scanned (this is the regression contract — without the ATA scan,
+    // `getSignaturesForAddress(owner)` would never return SPL transfers
+    // and USDC payments would silently miss detection).
+    expect(calledAddresses).toContain(owner);
+    expect(calledAddresses.length).toBeGreaterThan(1);
   });
 
   it("reads native SOL transfers from signature+transaction responses, using balance deltas", async () => {

@@ -205,14 +205,55 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
 
       // Per address: list recent signatures, fetch each tx, extract native +
       // SPL transfer amounts from pre/post balance deltas.
+      //
+      // Solana SPL transfers are addressed by the destination's Associated
+      // Token Account (ATA), not by the owner wallet. A "send USDC to
+      // ownerX" tx has [sender_signer, sender_ATA, dest_ATA, mint, ...] in
+      // its accountKeys — `ownerX` is NOT typically in the list, only its
+      // ATA. So `getSignaturesForAddress(ownerX)` returns nothing for
+      // incoming SPL transfers, and we'd miss every USDC/USDT payment to
+      // a Solana invoice.
+      //
+      // Fix: for every requested SPL token, derive the ATA(owner, mint)
+      // and scan its signatures too. Native SOL still scans the owner.
+      // Dedupe by signature so a tx that touches both owner and one of
+      // its ATAs (rare but possible — e.g., owner pays the create-ATA
+      // rent themselves) is only fetched + parsed once.
       const cutoffMs = sinceMs;
       const transfers: DetectedTransfer[] = [];
       const confirmationsFor = (sig: { confirmationStatus?: string }): number =>
         sig.confirmationStatus === "finalized" ? 32 : sig.confirmationStatus === "confirmed" ? 1 : 0;
 
       for (const address of addresses) {
-        const signatures = await client.getSignaturesForAddress(address, { limit: scanLimit });
-        for (const sig of signatures) {
+        // Build the scan-target list: owner + one ATA per relevant SPL mint.
+        // ATA derivation is deterministic (PDA from owner, mint, programs)
+        // so this is just CPU + a few hashes per (owner, mint) pair —
+        // negligible vs the per-signature RPC fetch below.
+        const scanTargets: string[] = [address];
+        if (wantsAnySpl) {
+          for (const mint of symbolByMint.keys()) {
+            try {
+              scanTargets.push(deriveAssociatedTokenAccount(address, mint));
+            } catch {
+              // ATA derivation can't realistically fail for a valid base58
+              // owner + mint, but if it does, skip this mint for this owner.
+            }
+          }
+        }
+        // Collect signatures across all targets, dedupe by signature.
+        // The same tx can surface from multiple targets (e.g. owner + its
+        // ATA when the owner co-signed an ATA-create); fetching it twice
+        // would double-count credits.
+        const allSigs = (await Promise.all(
+          scanTargets.map((t) => client.getSignaturesForAddress(t, { limit: scanLimit }))
+        )).flat();
+        const seenSignatures = new Set<string>();
+        const uniqueSignatures = allSigs.filter((s) => {
+          if (seenSignatures.has(s.signature)) return false;
+          seenSignatures.add(s.signature);
+          return true;
+        });
+        for (const sig of uniqueSignatures) {
           if (sig.err !== null) continue;
           if (sig.blockTime !== null && sig.blockTime * 1000 < cutoffMs) continue;
           const tx = await client.getTransaction(sig.signature);

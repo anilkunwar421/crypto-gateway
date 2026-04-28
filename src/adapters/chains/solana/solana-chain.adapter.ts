@@ -1,5 +1,5 @@
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { mnemonicToSeedSync } from "@scure/bip39";
+import { cachedMnemonicToSeed } from "../../crypto/mnemonic-cache.js";
 import { base58 } from "@scure/base";
 import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
@@ -139,7 +139,7 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       // We bind the addressIndex to the account segment so each invoice gets
       // a distinct keypair — matches what Phantom / Solflare users are used
       // to.
-      const seedBytes = mnemonicToSeedSync(seed);
+      const seedBytes = cachedMnemonicToSeed(seed);
       const node = derivePath(seedBytes, `m/44'/501'/${DEFAULT_ACCOUNT_INDEX}'/${index}'`);
       const publicKey = publicKeyFromPrivateKey(node.privateKey);
       const address = publicKeyBytesToAddress(publicKey) as Address;

@@ -93,8 +93,12 @@ export type CreateInvoiceInput = z.infer<typeof CreateInvoiceInputSchema>;
 export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invoice> {
   const parsed = CreateInvoiceInputSchema.parse(input);
 
-  // 1. Merchant must exist + be active.
-  const [merchant] = await deps.db
+  // 1. Merchant must exist + be active. Run in parallel with the
+  //    idempotency-by-externalId lookup — both are independent reads
+  //    against the same DB and the create path can't proceed without
+  //    either's answer, so awaiting them concurrently saves one RTT
+  //    (especially noticeable on Turso edge replicas).
+  const merchantPromise = deps.db
     .select({
       id: merchants.id,
       active: merchants.active,
@@ -106,24 +110,26 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     .from(merchants)
     .where(eq(merchants.id, parsed.merchantId))
     .limit(1);
+  const externalIdPromise: Promise<Invoice | null> = parsed.externalId !== undefined
+    ? loadInvoiceByExternalId(deps, parsed.merchantId, parsed.externalId)
+    : Promise.resolve(null);
+  const [merchantRows, existingByExternalId] = await Promise.all([
+    merchantPromise,
+    externalIdPromise
+  ]);
+  // 1b. Idempotency: if the merchant has already created an invoice with
+  //     this `external_id`, return the existing one (Stripe-style). Doing
+  //     this BEFORE pool allocation avoids burning a pool address per
+  //     duplicate attempt. The race window between this SELECT and the
+  //     INSERT below is closed by step 7's UNIQUE-violation fallback
+  //     (same return semantics).
+  if (existingByExternalId !== null) return existingByExternalId;
+  const [merchant] = merchantRows;
   if (!merchant) {
     throw new InvoiceError("MERCHANT_NOT_FOUND", `Merchant not found: ${parsed.merchantId}`);
   }
   if (merchant.active !== 1) {
     throw new InvoiceError("MERCHANT_INACTIVE", `Merchant is inactive: ${parsed.merchantId}`);
-  }
-
-  // 1b. Idempotency: if the merchant has already created an invoice with
-  //     this `external_id`, return the existing one (Stripe-style). The
-  //     external_id is the merchant's own dedup key — usually their order
-  //     number — so a retry of the same POST should be safe and return the
-  //     same invoice. Doing this BEFORE pool allocation avoids burning a
-  //     pool address per duplicate attempt. The race window between this
-  //     SELECT and the INSERT below is closed by step 7's UNIQUE-violation
-  //     fallback (same return semantics).
-  if (parsed.externalId !== undefined) {
-    const existing = await loadInvoiceByExternalId(deps, parsed.merchantId, parsed.externalId);
-    if (existing !== null) return existing;
   }
 
   // 2. Token must be registered for this chain. For the USD path this is
@@ -232,26 +238,22 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   // by allocatedToInvoiceId, so partial allocations (e.g. 2 of 3 families)
   // get released the same way as full ones.
   try {
+    // 5a. Build the (family, adapter, chainId) work-list. Same per-family
+    //     resolution as before, just collected up-front so the actual
+    //     allocations can run in parallel.
+    //
+    //   - EVM / Tron / Solana: one address per family (chain-agnostic key).
+    //   - UTXO primary: one address on parsed.chainId.
+    //   - UTXO non-primary: one address per registered UTXO chain (BTC + LTC
+    //     simultaneously for a universal invoice).
+    type AllocSpec = {
+      family: ChainFamily;
+      adapter: ChainAdapter;
+      chainId: ChainId;
+      isPrimary: boolean;
+    };
+    const allocSpecs: AllocSpec[] = [];
     for (const family of familyOrder) {
-      // Resolve the set of adapters to allocate addresses from for THIS family.
-      //
-      //   - EVM / Tron / Solana: one adapter per family handles every chainId,
-      //     and addresses are chain-agnostic across the family — so we
-      //     allocate exactly ONE address. The `chainId` recorded on the row
-      //     is the invoice's primary chainId (for the primary family) or a
-      //     conventional default (chainAdapter.supportedChainIds[0]) for
-      //     non-primary families.
-      //
-      //   - UTXO (primary): allocate one address on `parsed.chainId`'s chain
-      //     adapter exclusively. The merchant explicitly chose the chain.
-      //
-      //   - UTXO (non-primary on a non-UTXO-primary universal invoice):
-      //     allocate one address per REGISTERED UTXO chain (e.g. BTC + LTC
-      //     simultaneously, plus testnets if the deployment registers them).
-      //     Each lands as its own row keyed by `(invoice_id, family='utxo',
-      //     chain_id)`. This is the "$10 USD invoice payable in BTC OR LTC"
-      //     workflow — the customer picks which UTXO chain to pay on, the
-      //     gateway accepts whichever address gets funded first.
       const adaptersForFamily = resolveAllocationAdaptersForFamily({
         family,
         primaryFamily,
@@ -265,70 +267,91 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
           `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
         );
       }
-
       for (const { adapter, chainId } of adaptersForFamily) {
-        // UTXO family bypasses the address pool entirely — privacy heuristics
-        // on Bitcoin/Litecoin require non-reuse, and BIP84 derivation is
-        // cheap, so each invoice mints a fresh address from the per-chain
-        // monotonic counter. EVM/Tron/Solana keep using the existing pool path.
-        let canonical: string;
-        let addressIndex: number;
-        let poolAddressId: string | null;
-        if (family === "utxo") {
-          const seed = deps.secrets.getRequired("MASTER_SEED");
-          const allocated = await allocateUtxoAddress(deps, adapter, chainId, seed);
-          canonical = adapter.canonicalizeAddress(allocated.address);
-          addressIndex = allocated.addressIndex;
-          poolAddressId = null;
-        } else {
-          const allocated = await allocateForInvoice(deps, invoiceId, family);
-          canonical = adapter.canonicalizeAddress(allocated.address);
-          addressIndex = allocated.addressIndex;
-          poolAddressId = allocated.id;
-        }
-        receiveRows.push({
+        allocSpecs.push({
           family,
+          adapter,
           chainId,
-          address: canonical as InvoiceReceiveAddress["address"],
-          poolAddressId,
-          addressIndex
+          isPrimary: family === primaryFamily && chainId === parsed.chainId
         });
-        // Only the PRIMARY family's primary chain populates the legacy
-        // denormalized columns. For UTXO-primary that's the chosen UTXO
-        // chain; for EVM/Tron/Solana primary it's parsed.chainId.
-        if (family === primaryFamily && chainId === parsed.chainId) {
-          primaryAddress = canonical;
-          primaryAddressIndex = addressIndex;
+      }
+    }
+
+    // 5b. Run allocations in parallel — each (family, chainId) is independent.
+    //     UTXO bypasses the pool (fresh-per-invoice via the per-chain counter,
+    //     privacy heuristic). Account-model families take pool addresses via
+    //     allocateForInvoice; concurrent calls within the same family race
+    //     through the CAS in the pool service and end up on distinct rows.
+    //
+    //     Concurrently with allocations, kick off `snapshotRates` (USD path
+    //     only — single oracle call, often the slowest step in the create
+    //     path on a cold cache) and `secretsCipher.encrypt` (per-invoice
+    //     webhook secret if present). All three were sequential before;
+    //     hoisting them in parallel cuts wall-clock by their max instead of
+    //     their sum.
+    const seed = parsed.amountUsd !== undefined || allocSpecs.some((s) => s.family === "utxo")
+      ? deps.secrets.getRequired("MASTER_SEED")
+      : null;
+    const allocPromise = Promise.all(
+      allocSpecs.map(async (spec) => {
+        if (spec.family === "utxo") {
+          const allocated = await allocateUtxoAddress(deps, spec.adapter, spec.chainId, seed!);
+          return {
+            spec,
+            canonical: spec.adapter.canonicalizeAddress(allocated.address),
+            addressIndex: allocated.addressIndex,
+            poolAddressId: null as string | null
+          };
         }
+        const allocated = await allocateForInvoice(deps, invoiceId, spec.family);
+        return {
+          spec,
+          canonical: spec.adapter.canonicalizeAddress(allocated.address),
+          addressIndex: allocated.addressIndex,
+          poolAddressId: allocated.id as string | null
+        };
+      })
+    );
+    const ratesPromise = parsed.amountUsd !== undefined
+      ? snapshotRates(deps, tokensForFamilies(acceptedFamilies))
+      : Promise.resolve(null);
+    const webhookSecretPromise = parsed.webhookSecret !== undefined
+      ? deps.secretsCipher.encrypt(parsed.webhookSecret)
+      : Promise.resolve(null);
+    const [allocations, ratesSnapshot, webhookSecretCiphertext] = await Promise.all([
+      allocPromise,
+      ratesPromise,
+      webhookSecretPromise
+    ]);
+
+    // 5c. Materialize the allocation results into receiveRows + primary
+    //     denormalized fields.
+    for (const a of allocations) {
+      receiveRows.push({
+        family: a.spec.family,
+        chainId: a.spec.chainId,
+        address: a.canonical as InvoiceReceiveAddress["address"],
+        poolAddressId: a.poolAddressId,
+        addressIndex: a.addressIndex
+      });
+      if (a.spec.isPrimary) {
+        primaryAddress = a.canonical;
+        primaryAddressIndex = a.addressIndex;
       }
     }
     if (primaryAddress === null) {
       throw new Error("Invariant: primary family allocation missing");
     }
 
-    // 6. For USD-path invoices, snapshot the rate window now. Covers every
-    //    token registered in the accepted families + the family natives the
-    //    oracle can quote. Rates pinned for 10 minutes; detection refreshes
-    //    when it fires past expiry. Legacy invoices skip this entirely.
+    // 6. USD-path rate snapshot (already resolved above).
     let amountUsd: string | null = null;
     let ratesJson: string | null = null;
     let rateWindowExpiresAt: number | null = null;
-    if (parsed.amountUsd !== undefined) {
+    if (parsed.amountUsd !== undefined && ratesSnapshot !== null) {
       amountUsd = parsed.amountUsd;
-      const snapshot = await snapshotRates(deps, tokensForFamilies(acceptedFamilies));
-      ratesJson = JSON.stringify(snapshot.rates);
-      rateWindowExpiresAt = snapshot.expiresAt;
+      ratesJson = JSON.stringify(ratesSnapshot.rates);
+      rateWindowExpiresAt = ratesSnapshot.expiresAt;
     }
-
-    // 6b. Encrypt the per-invoice webhook secret if one was provided. Stored
-    //     ciphertext only; plaintext lives only in the request body and the
-    //     decrypt-then-HMAC stack frame at dispatch time. The pair (URL +
-    //     secret) is enforced by the input schema's refine — both NULL means
-    //     fall back to the merchant default.
-    const webhookSecretCiphertext =
-      parsed.webhookSecret !== undefined
-        ? await deps.secretsCipher.encrypt(parsed.webhookSecret)
-        : null;
 
     // 7. Insert the invoice row (denormalizes the primary family's address)
     //    and the per-family join rows in a single batch so a partial write

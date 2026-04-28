@@ -1,5 +1,5 @@
 import { HDKey } from "@scure/bip32";
-import { mnemonicToSeedSync } from "@scure/bip39";
+import { cachedMnemonicToSeed } from "../../crypto/mnemonic-cache.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.js";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
@@ -86,7 +86,7 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
     deriveAddress(seed: string, index: number) {
       // BIP84 native-segwit path: m/84'/coin'/account'/change/addressIndex.
       // coin = 0 for BTC, 2 for LTC (slip-0044).
-      const seedBytes = mnemonicToSeedSync(seed);
+      const seedBytes = cachedMnemonicToSeed(seed);
       const master = HDKey.fromMasterSeed(seedBytes);
       const child = master.derive(
         `m/84'/${chain.coinType}'/${accountIndex}'/${DEFAULT_CHANGE_INDEX}/${index}`

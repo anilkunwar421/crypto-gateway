@@ -161,13 +161,29 @@ export async function allocateForInvoice(
       .returning();
 
     if (claim) {
-      // Post-allocation: check the available count; if below trigger,
-      // schedule a background refill. This is what keeps the pool self-
-      // healing without any cron support.
-      const available = await countAvailable(deps, family);
-      if (available < REFILL_TRIGGER_THRESHOLD) {
-        scheduleRefill(deps, family);
-      }
+      // Post-allocation: check the available count and schedule a refill
+      // when below the trigger. This is what keeps the pool self-healing
+      // without any cron support.
+      //
+      // Detached on purpose: the count + scheduleRefill chain is a self-
+      // healing background concern, not part of the merchant's
+      // invoice-create critical path. Awaiting it here added a per-family
+      // SELECT count(*) to every invoice creation — on a Turso edge replica
+      // that's another 50–200 ms × N families. Fire-and-forget; errors
+      // log but don't propagate.
+      void (async () => {
+        try {
+          const available = await countAvailable(deps, family);
+          if (available < REFILL_TRIGGER_THRESHOLD) {
+            scheduleRefill(deps, family);
+          }
+        } catch (err) {
+          deps.logger.warn("pool.refill_check.failed", {
+            family,
+            error: err instanceof Error ? err.message : String(err)
+          });
+        }
+      })();
       return drizzleRowToPoolAddress(claim);
     }
     // CAS miss — another allocator got this row first. Retry with the next

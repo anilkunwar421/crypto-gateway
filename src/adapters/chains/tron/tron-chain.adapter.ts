@@ -1,5 +1,5 @@
 import { HDKey } from "@scure/bip32";
-import { mnemonicToSeedSync } from "@scure/bip39";
+import { cachedMnemonicToSeed } from "../../crypto/mnemonic-cache.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
@@ -180,7 +180,7 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
 
     deriveAddress(seed: string, index: number) {
       // BIP44 path for Tron = m/44'/195'/{account}'/{change}/{index}. Coin type 195.
-      const seedBytes = mnemonicToSeedSync(seed);
+      const seedBytes = cachedMnemonicToSeed(seed);
       const master = HDKey.fromMasterSeed(seedBytes);
       const child = master.derive(`m/44'/195'/${accountIndex}'/${DEFAULT_CHANGE_INDEX}/${index}`);
       if (!child.privateKey) {

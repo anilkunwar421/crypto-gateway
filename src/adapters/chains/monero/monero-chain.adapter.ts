@@ -230,7 +230,44 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
       // explicitly to the wallet's birthday block.
       const lastScanned = (await cache.getJSON<{ h: number }>(heightCacheKey))?.h;
       let fromHeight: number;
-      if (lastScanned !== undefined) {
+      // Stale-checkpoint guard. If the gateway had no live Monero invoices
+      // for a while (a quiet period), pollPayments skips the Monero chain
+      // entirely in its for loop — scanIncoming is never called and the
+      // cache `lastScanned` value freezes. When a fresh invoice is created
+      // later, naive resume-from-(lastScanned+1) means the scanner has to
+      // walk through the entire idle gap (potentially hundreds of blocks
+      // at 40 blocks/min) before reaching the customer's actual payment
+      // block. A 10h quiet gap = ~300 blocks = ~8 min of customer-facing
+      // detection lag. Bad UX.
+      //
+      // Fix: if the gap exceeds ~2h of Monero blocks (60 blocks at 2 min
+      // each), assume the gap is "no live invoices" and snap forward to
+      // within the recent window. Anything in the gap that we'd skip is
+      // safely either:
+      //   (a) a payment to an expired invoice's subaddress — already
+      //       excluded by the cron's live-invoice filter, so skipping
+      //       it changes nothing; or
+      //   (b) a payment to a never-issued address — cryptographically
+      //       impossible to land on one of our subaddresses by accident.
+      //
+      // The one risk this trades against: a multi-hour RPC outage where
+      // a live invoice WAS being paid during the gap, in which case the
+      // snap would skip those real payments. Operators who hit this can
+      // recover via POST /admin/debug/monero/force-ingest-tx with the
+      // missed txHash — every "block fetch failed" log line during the
+      // outage points to a window worth force-ingesting from the wallet
+      // history. That's a much better default than imposing 8+ minutes
+      // of detection lag on every merchant after every idle period.
+      const STALE_GAP_BLOCKS = 60;
+      const SNAP_WINDOW = 100;
+      if (lastScanned !== undefined && tipHeight - lastScanned > STALE_GAP_BLOCKS) {
+        const snappedFrom = Math.max(lastScanned + 1, tipHeight - SNAP_WINDOW);
+        logger?.warn(
+          "monero scanIncoming: stale checkpoint detected; snapping forward to recent window",
+          { chainId, lastScanned, tipHeight, gapBlocks: tipHeight - lastScanned, snappedFromHeight: snappedFrom }
+        );
+        fromHeight = snappedFrom;
+      } else if (lastScanned !== undefined) {
         fromHeight = lastScanned + 1;
       } else if (restoreHeight === 0) {
         fromHeight = Math.max(0, tipHeight - 100);

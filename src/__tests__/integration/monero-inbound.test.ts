@@ -688,6 +688,112 @@ describe("Monero detection — happy path", () => {
       await booted.close();
     }
   });
+
+  // Regression: when no live Monero invoices exist for an extended period
+  // (hours/days), pollPayments skips the Monero family entirely and the
+  // height checkpoint freezes. When a fresh invoice is created later, naive
+  // resume-from-(lastScanned+1) means walking thousands of stale blocks at
+  // 40 blocks/tick before reaching the customer's actual payment block —
+  // a 1+ hour silent gap from the merchant's perspective. Stale-checkpoint
+  // detection snaps forward when the gap exceeds STALE_GAP_BLOCKS (~12h).
+  it("scanIncoming snaps forward to a recent window when the cache is far behind tip", async () => {
+    const w = makeWallet("stale-checkpoint");
+    const booted = await bootTestApp({ merchants: [{ id: MERCHANT_ID }] });
+    try {
+      // Pre-seed the cache with a checkpoint 5,000 blocks behind tip — far
+      // beyond the 360-block stale threshold. Simulates ~7 days of quiet
+      // (no live invoices, cache frozen).
+      const fetchedHeights: number[] = [];
+      const TIP = 100_000;
+      const STALE_LAST_SCANNED = 95_000; // 5,000 blocks behind tip
+      await booted.deps.cache.putJSON(
+        `monero:last_scanned_height:${MONERO_CHAIN_ID}`,
+        { h: STALE_LAST_SCANNED }
+      );
+      const daemonClient: MoneroDaemonRpcClient = {
+        async getTipHeight() { return TIP; },
+        async getBlockTxHashesByHeight(h) {
+          fetchedHeights.push(h);
+          return [];
+        },
+        async getTransactions() { return []; }
+      };
+      const adapter = moneroChainAdapter({
+        chain: MONERO_MAINNET_CONFIG,
+        primaryAddress: w.primaryAddress,
+        viewKey: w.viewKey,
+        restoreHeight: 80_000, // explicit, not used because cache has a value
+        daemonClient,
+        cache: booted.deps.cache
+      });
+      const validAddress = w.primaryAddress as never;
+
+      await adapter.scanIncoming({
+        chainId: MONERO_CHAIN_ID,
+        addresses: [validAddress],
+        tokens: ["XMR" as never],
+        sinceMs: 0
+      });
+
+      // The scanner MUST NOT walk from 95_001 forward (would take hours).
+      // It MUST snap forward to within SNAP_WINDOW (100) of tip.
+      expect(fetchedHeights.length).toBeGreaterThan(0);
+      expect(fetchedHeights[0]).toBeGreaterThanOrEqual(TIP - 100);
+      expect(fetchedHeights[fetchedHeights.length - 1]).toBeLessThanOrEqual(TIP);
+      // Sanity: never went anywhere near the stale checkpoint.
+      expect(fetchedHeights.every((h) => h > STALE_LAST_SCANNED + 1000)).toBe(true);
+    } finally {
+      await booted.close();
+    }
+  });
+
+  // Counter-regression: a small gap (e.g. one tick missed because of a
+  // transient RPC failure) MUST NOT trigger snap-forward. The scanner
+  // should resume strictly from lastScanned+1 so we don't lose blocks.
+  // STALE_GAP_BLOCKS is currently 60 (~2h); use a 30-block gap to stay
+  // safely under it.
+  it("scanIncoming resumes strictly from lastScanned+1 when the gap is small (no snap)", async () => {
+    const w = makeWallet("small-gap");
+    const booted = await bootTestApp({ merchants: [{ id: MERCHANT_ID }] });
+    try {
+      const fetchedHeights: number[] = [];
+      const TIP = 100_000;
+      const RECENT_LAST_SCANNED = 99_970; // 30 blocks behind tip — well under 60
+      await booted.deps.cache.putJSON(
+        `monero:last_scanned_height:${MONERO_CHAIN_ID}`,
+        { h: RECENT_LAST_SCANNED }
+      );
+      const daemonClient: MoneroDaemonRpcClient = {
+        async getTipHeight() { return TIP; },
+        async getBlockTxHashesByHeight(h) {
+          fetchedHeights.push(h);
+          return [];
+        },
+        async getTransactions() { return []; }
+      };
+      const adapter = moneroChainAdapter({
+        chain: MONERO_MAINNET_CONFIG,
+        primaryAddress: w.primaryAddress,
+        viewKey: w.viewKey,
+        restoreHeight: 0,
+        daemonClient,
+        cache: booted.deps.cache
+      });
+      const validAddress = w.primaryAddress as never;
+
+      await adapter.scanIncoming({
+        chainId: MONERO_CHAIN_ID,
+        addresses: [validAddress],
+        tokens: ["XMR" as never],
+        sinceMs: 0
+      });
+
+      // First fetch must be exactly RECENT_LAST_SCANNED + 1; no gap skipped.
+      expect(fetchedHeights[0]).toBe(RECENT_LAST_SCANNED + 1);
+    } finally {
+      await booted.close();
+    }
+  });
 });
 
 describe("Monero payout (v1 stub)", () => {

@@ -29,7 +29,8 @@ const FAMILY_NATIVE_SYMBOLS: Readonly<Record<ChainFamily, readonly string[]>> = 
   evm: ["ETH", "BNB", "MATIC", "AVAX", "POL"],
   tron: ["TRX"],
   solana: ["SOL"],
-  utxo: ["BTC", "LTC"]
+  utxo: ["BTC", "LTC"],
+  monero: ["XMR"]
 };
 
 interface PayableToken {

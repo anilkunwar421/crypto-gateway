@@ -37,7 +37,10 @@ const SWEEP_MASTER_INDEX_BY_FAMILY: Readonly<Record<ChainFamily, number>> = {
   // its own spendable origin via the utxos ledger; payouts coin-select
   // across all owned UTXOs). Index reserved here to satisfy the exhaustive
   // family map; never actually used by the UTXO payout path.
-  utxo: SWEEP_MASTER_INDEX_BASE + 3
+  utxo: SWEEP_MASTER_INDEX_BASE + 3,
+  // Monero is inbound-only in v1 (no payouts), so sweep-master is never
+  // requested. Slot reserved to keep the family map exhaustive.
+  monero: SWEEP_MASTER_INDEX_BASE + 4
 };
 
 export class UnsupportedSignerOperationError extends Error {

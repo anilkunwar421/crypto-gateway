@@ -2,6 +2,7 @@ import { and, eq, gt, inArray } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainFamily, ChainId } from "../types/chain.js";
 import type { TokenSymbol } from "../types/token.js";
+import type { DetectedTransfer } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { ingestDetectedTransfer } from "./payment.service.js";
 import { invoices, invoiceReceiveAddresses } from "../../db/schema.js";
@@ -120,15 +121,43 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
     chainsPolled += 1;
     addressesWatched += addresses.length;
 
-    const transfers = await strategy.poll(deps, chainIdNumber as ChainId, addresses, tokens);
+    // Per-chain error isolation. Without this wrapper, ANY chain throwing
+    // (e.g. TronGrid rate-limiting with HTTP 429, an Esplora outage, a
+    // Monero public-node DNS hiccup) propagates out of the entire job and
+    // every chain after it in the iteration order silently goes unscanned
+    // for that tick. The chains have nothing in common — there's no reason
+    // a Tron 429 should silence Monero detection — so we catch + log + move
+    // on. Same shape per-transfer below: a single ingest failure (FK
+    // collision, malformed amountRaw, …) shouldn't block sibling transfers
+    // in the same batch.
+    let transfers: readonly DetectedTransfer[];
+    try {
+      transfers = await strategy.poll(deps, chainIdNumber as ChainId, addresses, tokens);
+    } catch (err) {
+      deps.logger.warn("pollPayments: chain poll failed; continuing with next chain", {
+        chainId: chainIdNumber,
+        family,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      continue;
+    }
     transfersFound += transfers.length;
 
     for (const transfer of transfers) {
-      const result = await ingestDetectedTransfer(deps, transfer);
-      if (result.inserted) {
-        transfersIngested += 1;
-      } else {
-        duplicates += 1;
+      try {
+        const result = await ingestDetectedTransfer(deps, transfer);
+        if (result.inserted) {
+          transfersIngested += 1;
+        } else {
+          duplicates += 1;
+        }
+      } catch (err) {
+        deps.logger.warn("pollPayments: ingestDetectedTransfer failed; continuing with next transfer", {
+          chainId: chainIdNumber,
+          txHash: transfer.txHash,
+          logIndex: transfer.logIndex,
+          error: err instanceof Error ? err.message : String(err)
+        });
       }
     }
   }

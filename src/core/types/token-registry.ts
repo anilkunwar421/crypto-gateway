@@ -137,6 +137,33 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
     isStable: false,
     displayName: "Litecoin (Testnet)"
   },
+  // Monero — XMR is the only asset on Monero; no ERC-20-style tokens. 12
+  // decimals: smallest unit is "piconero" (10⁻¹² XMR). chainId 1000 mainnet,
+  // 1001 stagenet (the operator-test chain), 1002 testnet.
+  {
+    symbol: "XMR" as TokenSymbol,
+    chainId: 1000 as ChainId,
+    contractAddress: null,
+    decimals: 12,
+    isStable: false,
+    displayName: "Monero"
+  },
+  {
+    symbol: "XMR" as TokenSymbol,
+    chainId: 1001 as ChainId,
+    contractAddress: null,
+    decimals: 12,
+    isStable: false,
+    displayName: "Monero (Stagenet)"
+  },
+  {
+    symbol: "XMR" as TokenSymbol,
+    chainId: 1002 as ChainId,
+    contractAddress: null,
+    decimals: 12,
+    isStable: false,
+    displayName: "Monero (Testnet)"
+  },
 
   // ===== ERC-20 / TRC-20 / SPL stablecoins =====
   // Ethereum mainnet

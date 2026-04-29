@@ -18,6 +18,9 @@ export const DEFAULT_CONFIRMATION_THRESHOLDS: Readonly<Record<number, number>> =
   801: 12,     // Litecoin mainnet (~30 min at 2.5-min blocks)
   802: 1,      // Bitcoin testnet3 — 1 confirmation (test environment)
   803: 1,      // Litecoin testnet — 1 confirmation
+  1000: 10,    // Monero mainnet (~20 min at 2-min blocks; Monero standard)
+  1001: 1,     // Monero stagenet — 1 confirmation
+  1002: 1,     // Monero testnet — 1 confirmation
   999: 1       // dev chain
 };
 

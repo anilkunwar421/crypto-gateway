@@ -41,6 +41,7 @@ export const COINCAP_DEFAULT_SYMBOL_MAP: Readonly<Record<string, string>> = {
   TRX: "tron",
   BTC: "bitcoin",
   LTC: "litecoin",
+  XMR: "monero",
   USDC: "usd-coin",
   USDT: "tether",
   DAI: "multi-collateral-dai",

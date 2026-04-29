@@ -65,6 +65,14 @@ export function tokensForFamilies(families: readonly ChainFamily[]): readonly To
     set.add("BTC");
     set.add("LTC");
   }
+  if (families.includes("monero")) {
+    // XMR is registered in TOKEN_REGISTRY for chainIds 1000/1001/1002, so
+    // the registry loop above already adds it. Stated explicitly here so a
+    // USD-pegged universal invoice with `acceptedFamilies: [..., "monero"]`
+    // always gets an XMR/USD rate snapshotted at create time even if a
+    // future registry refactor drops the native row.
+    set.add("XMR");
+  }
   return Array.from(set) as TokenSymbol[];
 }
 

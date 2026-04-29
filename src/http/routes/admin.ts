@@ -38,7 +38,14 @@ import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registr
 import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
 import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { migrate as drizzleMigrate } from "drizzle-orm/libsql/migrator";
-import { addressPool, alchemyWebhookRegistry, invoices, merchants, transactions } from "../../db/schema.js";
+import { addressPool, alchemyWebhookRegistry, invoiceReceiveAddresses, invoices, merchants, transactions } from "../../db/schema.js";
+import { isMoneroChainAdapter } from "../../adapters/chains/monero/monero-chain.adapter.js";
+import {
+  decodeRctAmount,
+  deriveSharedSecret,
+  expectedOutputPubkey,
+  parseAddress as parseMoneroAddress
+} from "../../adapters/chains/monero/monero-crypto.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
@@ -980,9 +987,11 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       const hasWebhook = webhookChainIds.has(id);
       // Per-chain "has at least one funded source" reduces to "the family has
 // any pool address" — the picker treats every pool row as a candidate.
-const hasFeeWallet = poolFamilies.has(
-  (deps.chains.find((a) => a.supportedChainIds.includes(id as ChainId))?.family) ?? "evm"
-);
+const adapterFamily = deps.chains.find((a) => a.supportedChainIds.includes(id as ChainId))?.family;
+// Monero is excluded — it has its own subaddress allocator, never the pool.
+const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
+  ? poolFamilies.has(adapterFamily)
+  : false;
       const webhooksSupported = ALCHEMY_FAMILY_BY_CHAIN_ID[id] !== undefined;
       const alchemyConfigured = alchemyConfiguredChainIds.has(id);
       out.push({
@@ -1017,9 +1026,11 @@ const hasFeeWallet = poolFamilies.has(
       const hasWebhook = webhookChainIds.has(id);
       // Per-chain "has at least one funded source" reduces to "the family has
 // any pool address" — the picker treats every pool row as a candidate.
-const hasFeeWallet = poolFamilies.has(
-  (deps.chains.find((a) => a.supportedChainIds.includes(id as ChainId))?.family) ?? "evm"
-);
+const adapterFamily = deps.chains.find((a) => a.supportedChainIds.includes(id as ChainId))?.family;
+// Monero is excluded — it has its own subaddress allocator, never the pool.
+const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
+  ? poolFamilies.has(adapterFamily)
+  : false;
       const webhooksSupported = ALCHEMY_FAMILY_BY_CHAIN_ID[id] !== undefined;
       const alchemyConfigured = alchemyConfiguredChainIds.has(id);
       out.push({
@@ -1186,6 +1197,528 @@ const hasFeeWallet = poolFamilies.has(
     }
   });
 
+  // Local helpers used only by the Monero inspect endpoint below. Defined
+  // inline rather than promoted to a shared util since they're unused
+  // anywhere else in admin and the file already imports `bytesToHex` for
+  // other purposes.
+  function hexBytes(hex: string): Uint8Array {
+    if (hex.length % 2 !== 0) throw new Error("hex string odd length");
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i += 1) {
+      out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    }
+    return out;
+  }
+  function eqBytes(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+  // Avoid the import collision — `bytesToHex` is already imported at the
+  // top of the file from `subtle.js`. Just alias for readability inline.
+  const bytesHex = (b: Uint8Array): string => bytesToHex(b);
+
+  // Monero diagnostic: run the full detection pipeline against ONE specific
+  // tx hash and return a step-by-step report of what the gateway sees.
+  //
+  // What it does:
+  //   1. Locate the wired Monero adapter (404 if not configured).
+  //   2. Fetch the tx via the gateway's daemon RPC client (so any RPC-side
+  //      problem — failed backends, Workers TLS rejection, malformed JSON —
+  //      surfaces here exactly the same way the cron sees it).
+  //   3. Pull the live Monero subaddresses from `invoice_receive_addresses`
+  //      (or accept an explicit list in the body for off-by-one debugging).
+  //   4. For every output, run the same shared-secret + expected-output-pubkey
+  //      derivation `scanIncoming` runs, against BOTH the primary tx pubkey
+  //      AND each additional pubkey. Report each candidate's outcome — match
+  //      or near-miss with the bytes that didn't agree.
+  //   5. For matches, decode the encrypted amount and report it.
+  //
+  // Use this when:
+  //   - A payment landed on-chain but the cron didn't ingest it. The report
+  //     answers: did we even fetch the tx? Did the crypto match? Was the
+  //     amount decoded? Did the sender use additional pubkeys?
+  //   - You want to validate a new subaddress derivation independent of
+  //     the cron / cache state.
+  //
+  // The endpoint is read-only — no DB writes, no cache changes.
+  app.post("/debug/monero/inspect-tx", async (c) => {
+    const moneroAdapter = deps.chains.find(isMoneroChainAdapter);
+    if (!moneroAdapter) {
+      return c.json(
+        { error: { code: "MONERO_NOT_WIRED", message: "Monero adapter is not configured on this deployment" } },
+        404
+      );
+    }
+
+    const rawBody = await c.req.text();
+    let body: { txHash?: unknown; addresses?: unknown };
+    try {
+      body = rawBody.length === 0 ? {} : JSON.parse(rawBody);
+    } catch {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    if (typeof body.txHash !== "string" || !/^[0-9a-f]{64}$/i.test(body.txHash)) {
+      return c.json(
+        { error: { code: "BAD_TX_HASH", message: "txHash must be a 64-hex-char string" } },
+        400
+      );
+    }
+    const txHash = body.txHash.toLowerCase();
+
+    // Subaddresses to test against. Caller can override (paste an
+    // arbitrary primary or subaddress to verify view-key-only ownership);
+    // default is every live Monero receive-address row in the DB. Live =
+    // any invoice_receive_addresses row regardless of invoice status, so
+    // expired invoices' addresses still get checked here (this endpoint
+    // is for forensics, not for the hot detection path).
+    let addresses: string[];
+    if (Array.isArray(body.addresses) && body.addresses.every((a) => typeof a === "string")) {
+      addresses = body.addresses as string[];
+    } else {
+      const rows = await deps.db
+        .select({ address: invoiceReceiveAddresses.address })
+        .from(invoiceReceiveAddresses)
+        .where(eq(invoiceReceiveAddresses.family, "monero"));
+      addresses = rows.map((r) => r.address);
+    }
+
+    // Step 1: fetch tx via the same RPC stack the cron uses.
+    let txs: Awaited<ReturnType<typeof moneroAdapter.moneroDaemonClient.getTransactions>>;
+    try {
+      txs = await moneroAdapter.moneroDaemonClient.getTransactions([txHash]);
+    } catch (err) {
+      return c.json({
+        ok: false,
+        step: "rpc.getTransactions",
+        error: err instanceof Error ? err.message : String(err)
+      }, 200);
+    }
+    const tx = txs[0];
+    if (!tx) {
+      return c.json({
+        ok: false,
+        step: "rpc.getTransactions",
+        error: "Daemon returned no tx for this hash. Either the txHash is wrong, the tx was orphaned, or the public node doesn't have it indexed.",
+        txHashRequested: txHash,
+        backendCount: undefined
+      }, 200);
+    }
+
+    // Step 2: parse subaddresses we'll match against.
+    type AddrInfo = { addressStr: string; spendPub: Uint8Array; viewPub: Uint8Array; isSubaddress: boolean };
+    const subaddrInfos: AddrInfo[] = [];
+    const skippedAddresses: { address: string; reason: string }[] = [];
+    for (const a of addresses) {
+      try {
+        const p = parseMoneroAddress(a);
+        subaddrInfos.push({
+          addressStr: a,
+          spendPub: p.publicSpendKey,
+          viewPub: p.publicViewKey,
+          isSubaddress: p.isSubaddress
+        });
+      } catch (err) {
+        skippedAddresses.push({ address: a, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // Step 3: per-output candidate matching, mirroring scanIncoming.
+    let primaryTxPub: Uint8Array | null = null;
+    if (tx.txPubkey.length > 0) {
+      try { primaryTxPub = hexBytes(tx.txPubkey); } catch { primaryTxPub = null; }
+    }
+
+    type OutputReport = {
+      outputIndex: number;
+      outputPublicKey: string;
+      candidateKeys: { source: "primary" | "additional"; txPubkey: string }[];
+      matched: { addressStr: string; via: "primary" | "additional"; sharedSecret: string; expectedOutputPubkey: string; amountRaw: string | null; amountDecodeError?: string } | null;
+      // When NOT matched, surface the per-candidate near-miss bytes so the
+      // operator can eyeball whether the crypto came close (typically it's
+      // either a clean match or completely unrelated bytes — there's no
+      // "almost matched" in elliptic-curve point comparison).
+      nearMisses: { source: "primary" | "additional"; subaddress: string; expectedOutputPubkey: string }[];
+    };
+
+    const outputReports: OutputReport[] = [];
+    for (let i = 0; i < tx.outputs.length; i += 1) {
+      const output = tx.outputs[i]!;
+      const candidateKeys: { source: "primary" | "additional"; txPubkey: string }[] = [];
+      const candidateBytes: { source: "primary" | "additional"; bytes: Uint8Array }[] = [];
+      if (primaryTxPub !== null) {
+        candidateKeys.push({ source: "primary", txPubkey: tx.txPubkey });
+        candidateBytes.push({ source: "primary", bytes: primaryTxPub });
+      }
+      const additional = tx.additionalPubkeys[i];
+      if (additional !== undefined && additional.length > 0) {
+        candidateKeys.push({ source: "additional", txPubkey: additional });
+        try {
+          candidateBytes.push({ source: "additional", bytes: hexBytes(additional) });
+        } catch {
+          // skip malformed
+        }
+      }
+
+      let outputPubBytes: Uint8Array | null = null;
+      try { outputPubBytes = hexBytes(output.publicKey); } catch { outputPubBytes = null; }
+      if (!outputPubBytes) {
+        outputReports.push({
+          outputIndex: i,
+          outputPublicKey: output.publicKey,
+          candidateKeys,
+          matched: null,
+          nearMisses: [{ source: "primary", subaddress: "(output pubkey malformed — skipping all subaddress checks)", expectedOutputPubkey: "" }]
+        });
+        continue;
+      }
+
+      let matched: OutputReport["matched"] = null;
+      const nearMisses: OutputReport["nearMisses"] = [];
+
+      outer: for (const cand of candidateBytes) {
+        let sharedSecret: Uint8Array;
+        try {
+          sharedSecret = deriveSharedSecret({
+            viewKeySecret: moneroAdapter.moneroViewKey,
+            txPubkey: cand.bytes,
+            outputIndex: i
+          });
+        } catch {
+          continue;
+        }
+        for (const info of subaddrInfos) {
+          const expected = expectedOutputPubkey({ sharedSecret, subaddressSpendPub: info.spendPub });
+          if (eqBytes(expected, outputPubBytes)) {
+            let amountRaw: string | null = null;
+            let amountDecodeError: string | undefined;
+            if (output.encryptedAmount && output.encryptedAmount.length === 16) {
+              try {
+                const ea = hexBytes(output.encryptedAmount);
+                amountRaw = decodeRctAmount({ sharedSecret, encryptedAmount: ea }).toString();
+              } catch (err) {
+                amountDecodeError = err instanceof Error ? err.message : String(err);
+              }
+            }
+            matched = {
+              addressStr: info.addressStr,
+              via: cand.source,
+              sharedSecret: bytesHex(sharedSecret),
+              expectedOutputPubkey: bytesHex(expected),
+              amountRaw,
+              ...(amountDecodeError ? { amountDecodeError } : {})
+            };
+            break outer;
+          }
+          // Only record the FIRST near-miss per (output, candidate) — the
+          // entire list would balloon for a wallet with thousands of
+          // subaddresses, and operators just need a sanity-check sample.
+          if (nearMisses.length < 4) {
+            nearMisses.push({ source: cand.source, subaddress: info.addressStr, expectedOutputPubkey: bytesHex(expected) });
+          }
+        }
+      }
+
+      outputReports.push({
+        outputIndex: i,
+        outputPublicKey: output.publicKey,
+        candidateKeys,
+        matched,
+        nearMisses
+      });
+    }
+
+    return c.json({
+      ok: true,
+      tx: {
+        txHash: tx.txHash,
+        blockHeight: tx.blockHeight,
+        isCoinbase: tx.isCoinbase,
+        primaryTxPubkey: tx.txPubkey,
+        additionalPubkeysCount: tx.additionalPubkeys.length,
+        additionalPubkeys: tx.additionalPubkeys,
+        outputCount: tx.outputs.length
+      },
+      gateway: {
+        network: moneroAdapter.moneroNetwork,
+        // Primary spend pub from the configured wallet — operator can
+        // verify this matches what they expect to see on-chain.
+        primarySpendPubHex: bytesHex(moneroAdapter.moneroPrimarySpendPub),
+        liveSubaddressesChecked: subaddrInfos.length,
+        skippedAddresses
+      },
+      outputs: outputReports,
+      summary: {
+        anyOutputMatched: outputReports.some((o) => o.matched !== null),
+        matchedOutputs: outputReports.filter((o) => o.matched !== null).map((o) => ({
+          outputIndex: o.outputIndex,
+          subaddress: o.matched!.addressStr,
+          via: o.matched!.via,
+          amountRaw: o.matched!.amountRaw
+        }))
+      }
+    }, 200);
+  });
+
+  // Monero scan-state diagnostic: shows EXACTLY what the cron's pollPayments
+  // sees vs what's persisted in invoice_receive_addresses. Answers the
+  // canonical "why isn't my payment being detected?" question in one curl.
+  //
+  // The cron filters subaddresses to those belonging to live invoices
+  // (pending/processing/completed AND expiresAt > now). A subaddress whose
+  // invoice has expired silently disappears from the cron's address set —
+  // and any payment made to it after expiry is permanently invisible to
+  // automatic detection. This endpoint exposes that gap by tagging each
+  // monero subaddress with `isLiveForPolling` so operators can see at a
+  // glance whether a missing-payment problem is "scanner not finding it"
+  // or "address dropped from cron because invoice expired".
+  app.get("/debug/monero/scan-state", async (c) => {
+    const moneroAdapter = deps.chains.find(isMoneroChainAdapter);
+    if (!moneroAdapter) {
+      return c.json({ error: { code: "MONERO_NOT_WIRED" } }, 404);
+    }
+
+    const now = deps.clock.now().getTime();
+    const rows = await deps.db
+      .select({
+        address: invoiceReceiveAddresses.address,
+        addressIndex: invoiceReceiveAddresses.addressIndex,
+        invoiceId: invoiceReceiveAddresses.invoiceId,
+        chainId: invoiceReceiveAddresses.chainId,
+        invoiceStatus: invoices.status,
+        invoiceExpiresAt: invoices.expiresAt,
+        invoiceCreatedAt: invoices.createdAt
+      })
+      .from(invoiceReceiveAddresses)
+      .leftJoin(invoices, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
+      .where(eq(invoiceReceiveAddresses.family, "monero"));
+
+    const liveStatuses = new Set(["pending", "processing", "completed"]);
+    const all = rows.map((r) => {
+      const isLiveStatus = r.invoiceStatus !== null && liveStatuses.has(r.invoiceStatus);
+      const isUnexpired = r.invoiceExpiresAt !== null && r.invoiceExpiresAt > now;
+      return {
+        address: r.address,
+        addressIndex: r.addressIndex,
+        invoiceId: r.invoiceId,
+        chainId: r.chainId,
+        invoiceStatus: r.invoiceStatus,
+        invoiceExpiresAt: r.invoiceExpiresAt,
+        invoiceExpiresAtIso: r.invoiceExpiresAt ? new Date(r.invoiceExpiresAt).toISOString() : null,
+        invoiceCreatedAtIso: r.invoiceCreatedAt ? new Date(r.invoiceCreatedAt).toISOString() : null,
+        isLiveForPolling: isLiveStatus && isUnexpired,
+        droppedReason: !isLiveStatus
+          ? `invoice status='${r.invoiceStatus}' (cron only scans pending/processing/completed)`
+          : !isUnexpired
+            ? `invoice expired at ${r.invoiceExpiresAt ? new Date(r.invoiceExpiresAt).toISOString() : "?"} (now=${new Date(now).toISOString()})`
+            : null
+      };
+    });
+
+    const heightCacheKey = `monero:last_scanned_height:${moneroAdapter.supportedChainIds[0]}`;
+    const cached = await deps.cache.getJSON<{ h: number }>(heightCacheKey);
+    let tipHeight: number | null = null;
+    try {
+      tipHeight = await moneroAdapter.moneroDaemonClient.getTipHeight();
+    } catch {
+      // best effort
+    }
+
+    return c.json({
+      ok: true,
+      cron: {
+        liveAddressCount: all.filter((a) => a.isLiveForPolling).length,
+        totalAddressCount: all.length,
+        droppedAddressCount: all.filter((a) => !a.isLiveForPolling).length,
+        lastScannedHeight: cached?.h ?? null,
+        currentTipHeight: tipHeight,
+        blocksBehindTip: tipHeight !== null && cached?.h !== undefined ? Math.max(0, tipHeight - cached.h) : null
+      },
+      addresses: all
+    }, 200);
+  });
+
+  // Monero forensic ingest: take a specific tx hash, run the same crypto
+  // matching as the cron, and ingest any matched outputs — INDEPENDENT of
+  // the cron's live-invoice filter. Designed for late-payment recovery
+  // when a customer paid a subaddress whose invoice has since expired.
+  //
+  // Behavior:
+  //   - Fetches the tx via the adapter's daemon client (same RPC stack the
+  //     cron uses).
+  //   - Tests every output against ALL monero subaddresses in
+  //     invoice_receive_addresses (no expiry filter, same as inspect-tx).
+  //   - For each match, calls ingestDetectedTransfer — which writes a
+  //     `transactions` row attributed to the matching invoice if the row
+  //     exists, OR an orphan row if not.
+  //   - Returns per-output: matched subaddress, amount, and ingest result
+  //     (inserted / duplicate / error).
+  //
+  // The matching invoice's status flips automatically through the standard
+  // recompute path. If the invoice is expired but matched (because pool/
+  // subaddress is still associated with it), the credit lands and the
+  // invoice can be recomputed; merchant-facing webhooks fire as configured.
+  app.post("/debug/monero/force-ingest-tx", async (c) => {
+    const moneroAdapter = deps.chains.find(isMoneroChainAdapter);
+    if (!moneroAdapter) {
+      return c.json({ error: { code: "MONERO_NOT_WIRED" } }, 404);
+    }
+    const rawBody = await c.req.text();
+    let body: { txHash?: unknown };
+    try {
+      body = rawBody.length === 0 ? {} : JSON.parse(rawBody);
+    } catch {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    if (typeof body.txHash !== "string" || !/^[0-9a-f]{64}$/i.test(body.txHash)) {
+      return c.json({ error: { code: "BAD_TX_HASH", message: "txHash must be a 64-hex-char string" } }, 400);
+    }
+    const txHash = body.txHash.toLowerCase();
+
+    let txs: Awaited<ReturnType<typeof moneroAdapter.moneroDaemonClient.getTransactions>>;
+    try {
+      txs = await moneroAdapter.moneroDaemonClient.getTransactions([txHash]);
+    } catch (err) {
+      // Match the structured-error shape used by inspect-tx and the other
+      // handlers in this file. Without this catch the error escapes Hono
+      // and surfaces as an undifferentiated 500, which is harder to wire
+      // into the operator's runbook.
+      return c.json({
+        error: {
+          code: "RPC_FAILED",
+          message: err instanceof Error ? err.message : String(err)
+        }
+      }, 502);
+    }
+    const tx = txs[0];
+    if (!tx) {
+      return c.json({ error: { code: "TX_NOT_FOUND", message: "Daemon returned no tx for this hash" } }, 404);
+    }
+
+    const addrRows = await deps.db
+      .select({ address: invoiceReceiveAddresses.address })
+      .from(invoiceReceiveAddresses)
+      .where(eq(invoiceReceiveAddresses.family, "monero"));
+    const subaddrInfos = addrRows
+      .map((r) => {
+        try {
+          return { addressStr: r.address, spendPub: parseMoneroAddress(r.address).publicSpendKey };
+        } catch {
+          return null;
+        }
+      })
+      .filter((x): x is { addressStr: string; spendPub: Uint8Array } => x !== null);
+
+    let primaryTxPub: Uint8Array | null = null;
+    if (tx.txPubkey.length > 0) {
+      try { primaryTxPub = hexBytes(tx.txPubkey); } catch { primaryTxPub = null; }
+    }
+
+    type Result = { outputIndex: number; matched: boolean; subaddress?: string; amountRaw?: string; ingest?: { inserted: boolean; transactionId?: string | undefined; invoiceId?: string | null; error?: string } };
+    const results: Result[] = [];
+    const tipHeight = await moneroAdapter.moneroDaemonClient.getTipHeight().catch(() => 0);
+
+    for (let i = 0; i < tx.outputs.length; i += 1) {
+      const output = tx.outputs[i]!;
+      let outputPubBytes: Uint8Array;
+      try { outputPubBytes = hexBytes(output.publicKey); } catch { continue; }
+
+      const candidates: Uint8Array[] = [];
+      if (primaryTxPub !== null) candidates.push(primaryTxPub);
+      const additional = tx.additionalPubkeys[i];
+      if (additional !== undefined && additional.length > 0) {
+        try { candidates.push(hexBytes(additional)); } catch { /* skip */ }
+      }
+
+      let matchedAddr: string | null = null;
+      let matchedSecret: Uint8Array | null = null;
+      outer: for (const cand of candidates) {
+        let sharedSecret: Uint8Array;
+        try {
+          sharedSecret = deriveSharedSecret({ viewKeySecret: moneroAdapter.moneroViewKey, txPubkey: cand, outputIndex: i });
+        } catch { continue; }
+        for (const info of subaddrInfos) {
+          const expected = expectedOutputPubkey({ sharedSecret, subaddressSpendPub: info.spendPub });
+          if (eqBytes(expected, outputPubBytes)) {
+            matchedAddr = info.addressStr;
+            matchedSecret = sharedSecret;
+            break outer;
+          }
+        }
+      }
+
+      if (!matchedAddr || !matchedSecret) {
+        results.push({ outputIndex: i, matched: false });
+        continue;
+      }
+      if (!output.encryptedAmount || output.encryptedAmount.length !== 16) {
+        results.push({ outputIndex: i, matched: true, subaddress: matchedAddr, ingest: { inserted: false, error: "encrypted amount missing or wrong length" } });
+        continue;
+      }
+      let amountRaw: bigint;
+      try {
+        amountRaw = decodeRctAmount({ sharedSecret: matchedSecret, encryptedAmount: hexBytes(output.encryptedAmount) });
+      } catch (err) {
+        results.push({ outputIndex: i, matched: true, subaddress: matchedAddr, ingest: { inserted: false, error: `amount decode: ${err instanceof Error ? err.message : String(err)}` } });
+        continue;
+      }
+      if (amountRaw <= 0n) {
+        results.push({ outputIndex: i, matched: true, subaddress: matchedAddr, amountRaw: amountRaw.toString(), ingest: { inserted: false, error: "amount <= 0" } });
+        continue;
+      }
+
+      const blockHeight = tx.blockHeight ?? 0;
+      try {
+        const ingestResult = await ingestDetectedTransfer(deps, {
+          chainId: moneroAdapter.supportedChainIds[0]!,
+          txHash: tx.txHash,
+          logIndex: i,
+          fromAddress: "monero_unknown_sender",
+          toAddress: matchedAddr,
+          token: "XMR",
+          amountRaw: amountRaw.toString(),
+          blockNumber: blockHeight,
+          confirmations: Math.max(0, tipHeight - blockHeight),
+          seenAt: new Date(deps.clock.now().getTime())
+        });
+        results.push({
+          outputIndex: i,
+          matched: true,
+          subaddress: matchedAddr,
+          amountRaw: amountRaw.toString(),
+          ingest: {
+            inserted: ingestResult.inserted,
+            transactionId: ingestResult.transactionId,
+            invoiceId: ingestResult.invoiceId ?? null
+          }
+        });
+      } catch (err) {
+        results.push({
+          outputIndex: i,
+          matched: true,
+          subaddress: matchedAddr,
+          amountRaw: amountRaw.toString(),
+          ingest: { inserted: false, error: err instanceof Error ? err.message : String(err) }
+        });
+      }
+    }
+
+    return c.json({
+      ok: true,
+      txHash: tx.txHash,
+      blockHeight: tx.blockHeight,
+      results,
+      summary: {
+        outputsMatched: results.filter((r) => r.matched).length,
+        ingested: results.filter((r) => r.ingest?.inserted).length,
+        duplicates: results.filter((r) => r.ingest && !r.ingest.inserted && !r.ingest.error).length,
+        errors: results.filter((r) => r.ingest?.error).length
+      }
+    }, 200);
+  });
+
   // HD-derivation audit: for every address_pool row, derive the expected
   // address from MASTER_SEED at that row's address_index and compare.
   // Mismatches mean the row's key is NOT derivable from the current seed
@@ -1222,7 +1755,9 @@ const hasFeeWallet = poolFamilies.has(
         unscannedBeyondLimit: number;
       };
 
-      const families: readonly ChainFamily[] = ["evm", "tron", "solana"];
+      // Excludes 'monero' (no fee-wallet / pool topology) and 'utxo'
+      // (uses its own per-invoice address counter, not the pool).
+      const families: readonly ("evm" | "tron" | "solana")[] = ["evm", "tron", "solana"];
       const reports: FamilyReport[] = [];
 
       for (const family of families) {
@@ -1845,7 +2380,9 @@ const hasFeeWallet = poolFamilies.has(
   // "which families does the chain registry know about" call.
   app.get("/fee-wallets", async (c) => {
     try {
-      const families: readonly ChainFamily[] = ["evm", "tron", "solana"];
+      // Excludes 'monero' (no fee-wallet / pool topology) and 'utxo'
+      // (uses its own per-invoice address counter, not the pool).
+      const families: readonly ("evm" | "tron" | "solana")[] = ["evm", "tron", "solana"];
       const rows = await Promise.all(
         families.map(async (family) => {
           const rec = await deps.feeWalletStore.get(family);
@@ -1881,6 +2418,16 @@ const hasFeeWallet = poolFamilies.has(
         400
       );
     }
+    // Monero has no fee-wallet topology in v1 (inbound-only) and never
+    // touches the address pool. Reject loudly rather than letting a
+    // misconfigured admin call silently fail at the pool lookup.
+    if (family.data === "monero") {
+      return c.json(
+        { error: { code: "BAD_FAMILY", message: "Monero does not support fee wallets (inbound-only in v1)" } },
+        400
+      );
+    }
+    const familyData: "evm" | "tron" | "solana" | "utxo" = family.data;
     const body = (await c.req.json().catch(() => null)) as { address?: unknown } | null;
     if (body === null || typeof body.address !== "string" || body.address.length === 0) {
       return c.json(
@@ -1915,7 +2462,7 @@ const hasFeeWallet = poolFamilies.has(
       const [poolRow] = await deps.db
         .select({ id: addressPool.id })
         .from(addressPool)
-        .where(and(eq(addressPool.family, family.data), eq(addressPool.address, canonical)))
+        .where(and(eq(addressPool.family, familyData), eq(addressPool.address, canonical)))
         .limit(1);
       if (!poolRow) {
         return c.json(

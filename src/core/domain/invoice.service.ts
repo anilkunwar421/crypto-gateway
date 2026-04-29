@@ -16,6 +16,8 @@ import { drizzleRowToInvoice, drizzleRowToTransaction, fetchInvoiceReceiveAddres
 import { DomainError } from "../errors.js";
 import { allocateForInvoice, releaseFromInvoice } from "./pool.service.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
+import { allocateMoneroSubaddress } from "./monero-subaddress-allocator.js";
+import { isMoneroChainAdapter } from "../../adapters/chains/monero/monero-chain.adapter.js";
 import { addUsd, RateUnavailableError, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
 import { resolveMerchantConfirmationThreshold } from "./payment-config.js";
 import { invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
@@ -296,6 +298,31 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
       allocSpecs.map(async (spec) => {
         if (spec.family === "utxo") {
           const allocated = await allocateUtxoAddress(deps, spec.adapter, spec.chainId, seed!);
+          return {
+            spec,
+            canonical: spec.adapter.canonicalizeAddress(allocated.address),
+            addressIndex: allocated.addressIndex,
+            poolAddressId: null as string | null
+          };
+        }
+        if (spec.family === "monero") {
+          // Monero uses a single gateway-managed wallet — view key + primary
+          // spend pub baked into the adapter at boot. Allocator atomically
+          // bumps the per-chainId subaddress counter and derives the next
+          // subaddress under account 0. Spend authority stays out of the
+          // gateway entirely (operator settles funds from their own wallet).
+          if (!isMoneroChainAdapter(spec.adapter)) {
+            throw new Error(
+              `Invariant: family='monero' adapter is missing Monero key material — boot wiring bug`
+            );
+          }
+          const allocated = await allocateMoneroSubaddress({
+            deps,
+            chainId: spec.chainId,
+            network: spec.adapter.moneroNetwork,
+            viewKey: spec.adapter.moneroViewKey,
+            primarySpendPub: spec.adapter.moneroPrimarySpendPub
+          });
           return {
             spec,
             canonical: spec.adapter.canonicalizeAddress(allocated.address),

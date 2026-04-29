@@ -534,6 +534,130 @@ Per-chain config has three operational benefits:
   pre-segwit RBF, etc.)
 - BCH / DOGE / Zcash-transparent (additional UTXO chains under the same family)
 
+## Monero (XMR) — inbound only in v1
+
+Monero is materially different from every other chain family because of the
+privacy model: there is no public way to see "X paid Y for Z" — recipients
+must scan blocks with a **secret view key** to identify their incoming
+outputs, and amounts are hidden in Pedersen commitments only the same view
+key can unblind.
+
+**v1 ships inbound only.** The gateway holds the operator's primary address
++ secret view key (sufficient for detection — no spend authority). Funds
+settle to merchants out-of-band via the operator's own wallet. v2 can add
+gateway-mediated payouts later if real demand surfaces; for now,
+`POST /api/v1/payouts` for a Monero `chainId` returns
+`PAYOUT_NOT_SUPPORTED_ON_FAMILY` (HTTP 400).
+
+| Chain | chainId | Native | Address prefix |
+| --- | --- | --- | --- |
+| Monero mainnet | 1000 | XMR (12 decimals) | `4…` (95 chars) primary, `8…` subaddress |
+| Monero stagenet | 1001 | XMR | stagenet prefix bytes |
+| Monero testnet | 1002 | XMR | testnet prefix bytes |
+
+### Operator setup
+
+Configure four env vars to wire the Monero adapter. **All optional** —
+unset means the adapter is not registered and merchants can't accept XMR.
+
+| Env var | Required | Description |
+| --- | --- | --- |
+| `MONERO_PRIMARY_ADDRESS` | Yes (to enable XMR) | The wallet's 95-char primary address. Network is detected from the prefix; must match `MONERO_NETWORK`. |
+| `MONERO_VIEW_KEY` | Yes | 64 hex chars = 32-byte secret view key. Validated at boot — must derive back to the public view key embedded in the primary address, otherwise the gateway refuses to start. |
+| `MONERO_NETWORK` | No (default `mainnet`) | `mainnet` / `stagenet` / `testnet`. |
+| `MONERO_RESTORE_HEIGHT` | No (default `0`) | Block to start scanning from. Set this to your wallet's birthday block — otherwise the first detection tick after deploy backfills years of pre-creation history. |
+| `MONERO_RPC_URLS` | No | Comma-separated daemon RPC URLs. Defaults to a curated public-node list (`node.community.rino.io`, `xmr-node.cakewallet.com`, `node.sethforprivacy.com`, `node.monero.net`). Override for self-hosted `monerod` or paid mirror. |
+
+**Spend key never reaches the gateway.** Detection only needs the view key
++ primary address. Operators settle funds via `monero-wallet-cli` or any
+real Monero wallet against the same seed/keys outside the gateway.
+
+### How invoices work
+
+`POST /api/v1/invoices` with `chainId: 1000, token: "XMR"`:
+
+```bash
+curl -X POST "$GATEWAY_URL/api/v1/invoices" \
+  -H "Authorization: Bearer $MERCHANT_API_KEY" \
+  -d '{
+    "chainId": 1000,
+    "token": "XMR",
+    "amountRaw": "100000000000",
+    "expiresInMinutes": 60
+  }'
+```
+
+Each invoice mints a unique **subaddress** under `account 0` from the
+gateway's wallet. Index 0 is the primary; index 1+ are per-invoice. The
+counter lives in `monero_subaddress_counters` and is bumped atomically on
+every Monero invoice creation. The subaddress is stored on
+`invoice_receive_addresses` (with `family='monero'`,
+`addressIndex=N`, `poolAddressId=NULL`) so the operator can reconcile
+incoming txs against invoices using `account 0 / subaddress N` in their
+own wallet.
+
+### Detection model
+
+The detection cron (default 1-minute tick) calls the Monero adapter's
+`scanIncoming` which:
+
+1. Reads the last-scanned block height from cache (cold cache →
+   `MONERO_RESTORE_HEIGHT`).
+2. Fetches blocks from the public daemon RPC (failover across the
+   configured backends).
+3. For each tx output, locally derives the shared secret with the view
+   key and checks whether the output goes to one of the gateway's live
+   subaddresses.
+4. On match, unblinds the RingCT-encrypted amount and emits a
+   `DetectedTransfer` to the standard ingest path. The invoice flips to
+   `processing`, then `completed` after `confirmation_threshold` blocks
+   (default 10 for Monero mainnet, configurable via `FINALITY_OVERRIDES`
+   or per-merchant `confirmationThresholds`).
+
+A malicious public node could **omit** transactions but cannot **forge**
+credits — the cryptographic match would fail recipient-side. The failover
+list provides **liveness only** in v1: it returns the first backend that
+responds and does NOT cross-check responses across nodes. **A malicious
+primary node can silently drop incoming payments.** Operators concerned
+about omission should self-host `monerod` and set `MONERO_RPC_URLS=https://
+your-node.example`. v2 may add a consensus-of-N tip-and-block-hash
+pre-flight to mitigate single-node omission against community nodes.
+
+### Operational hazards to know about
+
+- **Key rotation freezes pre-rotation invoices.** Subaddresses derive from
+  `Hs("SubAddr\0" || viewKey || account || index)`. If the operator
+  rotates the wallet's view key (or spend key — the primary address
+  changes), every subaddress already minted under the OLD keys is
+  unreachable: detection scans with the NEW view key, computes a different
+  expected output pubkey, and silently misses payments to the old
+  subaddresses. Mitigation: drain the wallet AND let all in-flight
+  Monero invoices reach a terminal state BEFORE rotating; or — if the
+  rotation is forced — manually mark every open monero invoice as
+  `expired` so the customer is prompted to retry against a fresh subaddress.
+- **Default `MONERO_RESTORE_HEIGHT=0`.** A fresh deployment without an
+  explicit restore height auto-snaps cold-start scans to `tipHeight - 100`
+  blocks (~3 hours of grace) so the gateway doesn't burn ~11 days of
+  public-node budget catching up from genesis. To backfill earlier
+  history (e.g., a wallet with on-chain activity from before the gateway
+  was wired up), set `MONERO_RESTORE_HEIGHT` to the wallet's birthday
+  block before first boot. The cron will chunk the catchup at
+  `maxBlocksPerTick=200` per tick.
+- **Public-node trust is liveness-only in v1.** See the detection-model
+  paragraph above. Operators concerned about omission should run their
+  own `monerod` and set `MONERO_RPC_URLS`.
+
+### What's NOT in v1
+
+- **Payouts.** No gateway-mediated outbound XMR. v2.
+- **Per-merchant Monero wallets.** All XMR-accepting merchants share the
+  operator's single Monero wallet. Per-merchant wallets are a v3 schema
+  change if real demand surfaces.
+- **Multiple Monero accounts.** Account 0 only; subaddress index
+  increments. Trivial follow-up if needed.
+- **Live XMR balance in `/admin/balances`.** Requires re-scanning every
+  output ever received (same work as detection); deferred to v2.
+
 ## Multi-family invoice acceptance
 
 An invoice can accept payment across multiple chain families. The merchant sets

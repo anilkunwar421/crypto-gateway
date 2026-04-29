@@ -27,6 +27,18 @@ import {
   LITECOIN_CONFIG,
   utxoConfigForChainId
 } from "../adapters/chains/utxo/utxo-config.js";
+import { moneroChainAdapter } from "../adapters/chains/monero/monero-chain.adapter.js";
+import {
+  MONERO_MAINNET_CONFIG,
+  MONERO_STAGENET_CONFIG,
+  MONERO_TESTNET_CONFIG,
+  type MoneroChainConfig
+} from "../adapters/chains/monero/monero-config.js";
+import {
+  moneroDaemonRpcClient,
+  parseMoneroRpcUrlsEnv,
+  parseMoneroRpcHeadersEnv
+} from "../adapters/chains/monero/monero-rpc.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
@@ -196,6 +208,46 @@ async function main(): Promise<void> {
   logger.info("UTXO chains wired", {
     chainIds: [BITCOIN_CONFIG.chainId, LITECOIN_CONFIG.chainId]
   });
+
+  // Monero (XMR) inbound wiring. Conditional: needs both MONERO_PRIMARY_ADDRESS
+  // and MONERO_VIEW_KEY. Without them the adapter is simply not registered
+  // (not a boot error — most deployments don't accept XMR). With them the
+  // adapter validates view key ↔ address at construction so a bad paste
+  // surfaces here, not on the first invoice.
+  if (config.moneroPrimaryAddress !== undefined && config.moneroViewKey !== undefined) {
+    const moneroChain: MoneroChainConfig =
+      config.moneroNetwork === "stagenet"
+        ? MONERO_STAGENET_CONFIG
+        : config.moneroNetwork === "testnet"
+          ? MONERO_TESTNET_CONFIG
+          : MONERO_MAINNET_CONFIG;
+    const rpcUrls = parseMoneroRpcUrlsEnv(config.moneroRpcUrls) ?? moneroChain.defaultRpcUrls;
+    const rpcHeaders = parseMoneroRpcHeadersEnv(config.moneroRpcHeadersJson);
+    const viewKeyBytes = hexToBytes32(config.moneroViewKey, "MONERO_VIEW_KEY");
+    chains.push(
+      moneroChainAdapter({
+        chain: moneroChain,
+        primaryAddress: config.moneroPrimaryAddress,
+        viewKey: viewKeyBytes,
+        restoreHeight: config.moneroRestoreHeight,
+        daemonClient: moneroDaemonRpcClient({
+          backends: rpcUrls.map((u) => rpcHeaders ? { baseUrl: u, headers: rpcHeaders } : { baseUrl: u }),
+          logger
+        }),
+        cache,
+        logger
+      })
+    );
+    detectionStrategies[moneroChain.chainId] = rpcPollDetection();
+    logger.info("Monero adapter wired", {
+      chainId: moneroChain.chainId,
+      network: config.moneroNetwork,
+      restoreHeight: config.moneroRestoreHeight,
+      backendCount: rpcUrls.length,
+      // Header NAMES only — never log values; they're auth secrets.
+      authHeaderNames: rpcHeaders ? Object.keys(rpcHeaders) : []
+    });
+  }
 
   // Secrets-at-rest cipher. In prod/staging `SECRETS_ENCRYPTION_KEY` is
   // required (config.schema.ts enforces); in dev/test we fall back to the
@@ -428,6 +480,24 @@ async function seedDefaultMerchantIfMissing(
     updatedAt: now
   });
   logger.warn("dev-only: seeded default merchant", { id: "00000000-0000-0000-0000-000000000001" });
+}
+
+// Decode a 64-hex-char string into 32 bytes. Throws with a stable error
+// shape if the env var is the wrong length or has non-hex characters —
+// caught at boot rather than producing a silently-broken adapter.
+function hexToBytes32(hex: string, varName: string): Uint8Array {
+  const stripped = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (stripped.length !== 64) {
+    throw new Error(`${varName} must be 64 hex characters (32 bytes); got ${stripped.length}`);
+  }
+  if (!/^[0-9a-fA-F]+$/.test(stripped)) {
+    throw new Error(`${varName} contains non-hex characters`);
+  }
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i += 1) {
+    out[i] = parseInt(stripped.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
 }
 
 void main();

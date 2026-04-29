@@ -216,6 +216,30 @@ export const addressIndexCounters = sqliteTable("address_index_counters", {
   updatedAt: integer("updated_at").notNull()
 });
 
+// ---- monero_subaddress_counters (per-Monero-chain subaddress index) ----
+//
+// Same shape as `address_index_counters`, but for Monero subaddress indices
+// instead of BIP44 derivation indices. The gateway holds a single Monero
+// wallet (configured via env vars) and mints a fresh subaddress under
+// `account 0` for every Monero-accepting invoice. Privacy + clean
+// invoice→tx mapping.
+//
+// Why a separate table: address_index_counters is keyed by chainId and the
+// counter increments under BIP44 / BIP84 / SLIP-0010 semantics. Monero
+// subaddresses are derived under a Monero-specific keypair structure and
+// have no shared semantics with the other counters; keeping them apart
+// makes both schemas trivially auditable and avoids accidental
+// cross-pollination.
+//
+// Index 0 is the merchant's primary address; the first invoice subaddress
+// is always index 1. We default `next_index` to 1 (not 0) so the very
+// first invoice on a fresh deployment gets index 1.
+export const moneroSubaddressCounters = sqliteTable("monero_subaddress_counters", {
+  chainId: integer("chain_id").primaryKey(),
+  nextIndex: integer("next_index").notNull().default(1),
+  updatedAt: integer("updated_at").notNull()
+});
+
 // ---- transactions (detected on-chain transfers, tied to an invoice when matched) ----
 
 export const transactions = sqliteTable(
@@ -725,7 +749,12 @@ export const addressPool = sqliteTable(
   "address_pool",
   {
     id: text("id").primaryKey(),
-    family: text("family", { enum: ["evm", "tron", "solana", "utxo"] }).notNull(),
+    // Includes 'monero' for TS-side uniformity with other family-keyed
+    // tables, even though Monero never actually inserts here (it uses
+    // its own subaddress counter, not the shared pool). The SQL CHECK
+    // constraint stays narrow ('evm','tron','solana','utxo') — defense
+    // in depth: a misrouted insert would fail at the DB level.
+    family: text("family", { enum: ["evm", "tron", "solana", "utxo", "monero"] }).notNull(),
     addressIndex: integer("address_index").notNull(),
     // Canonical form — hex for EVM, base58 for Tron/Solana.
     address: text("address").notNull(),
@@ -808,7 +837,11 @@ export const feeWallets = sqliteTable(
   "fee_wallets",
   {
     id: text("id").primaryKey(),
-    family: text("family", { enum: ["evm", "tron", "solana", "utxo"] }).notNull(),
+    // Includes 'monero' for TS-side uniformity with other family-keyed
+    // tables, even though Monero never inserts here (Monero is inbound-only
+    // in v1, no payouts → no fee-wallet topology). The SQL CHECK below stays
+    // narrow ('evm','tron','solana','utxo') — defense in depth at the DB.
+    family: text("family", { enum: ["evm", "tron", "solana", "utxo", "monero"] }).notNull(),
     mode: text("mode", { enum: ["hd-pool", "imported"] }).notNull(),
     // Canonical address form — matches the corresponding chain adapter's
     // canonicalizeAddress output. For hd-pool mode this MUST equal an
@@ -848,7 +881,7 @@ export const invoiceReceiveAddresses = sqliteTable(
     invoiceId: text("invoice_id")
       .notNull()
       .references(() => invoices.id),
-    family: text("family", { enum: ["evm", "tron", "solana", "utxo"] }).notNull(),
+    family: text("family", { enum: ["evm", "tron", "solana", "utxo", "monero"] }).notNull(),
     // chainId of THIS specific receive address. For account-model families
     // (EVM/Tron/Solana) where a single address is valid across every chain
     // in the family, this is set to the invoice's primary chainId — purely
@@ -886,7 +919,7 @@ export const invoiceReceiveAddresses = sqliteTable(
     primaryKey({ columns: [t.invoiceId, t.family, t.chainId] }),
     index("idx_invoice_rx_address").on(t.address),
     index("idx_invoice_rx_pool").on(t.poolAddressId),
-    check("invoice_rx_family_check", sql`${t.family} IN ('evm','tron','solana','utxo')`)
+    check("invoice_rx_family_check", sql`${t.family} IN ('evm','tron','solana','utxo','monero')`)
   ]
 );
 
@@ -938,6 +971,7 @@ export const schema = {
   merchants,
   invoices,
   addressIndexCounters,
+  moneroSubaddressCounters,
   transactions,
   utxos,
   payoutReservations,

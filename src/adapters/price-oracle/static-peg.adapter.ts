@@ -34,7 +34,8 @@ export const DEFAULT_NATIVE_RATES: Readonly<Record<string, string>> = {
   SOL: "150",
   TRX: "0.25",
   BTC: "65000",
-  LTC: "85"
+  LTC: "85",
+  XMR: "200"
 };
 
 // Default pegged-stable set used by static-peg + as the rate-window's

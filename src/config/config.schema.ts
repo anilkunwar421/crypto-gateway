@@ -85,6 +85,36 @@ export const AppConfigSchema = z
     solanaRpcUrl: z.string().optional(),
     solanaNetwork: z.enum(["mainnet", "devnet"]).default("mainnet"),
 
+    // Monero (XMR). Inbound-only in v1: the gateway holds the operator's
+    // primary address + secret view key (sufficient for detection). Spend
+    // key never reaches the gateway — funds settle out-of-band via the
+    // operator's wallet. All four vars are optional; if MONERO_PRIMARY_ADDRESS
+    // and MONERO_VIEW_KEY are both unset the adapter is simply not wired
+    // and merchants can't accept XMR.
+    //   - MONERO_PRIMARY_ADDRESS: 95-char base58 (mainnet) / 95-char (stagenet
+    //     prefix differs but length matches). The view key MUST derive back
+    //     to the public view key embedded here — boot validation throws on
+    //     mismatch.
+    //   - MONERO_VIEW_KEY: 64 hex chars = 32 bytes secret view key.
+    //   - MONERO_NETWORK: mainnet | stagenet | testnet. Default mainnet.
+    //     Validated against the address prefix at boot.
+    //   - MONERO_RESTORE_HEIGHT: block to start scanning from. Default 0
+    //     (re-scan everything). Operators set this to the wallet's birthday
+    //     so a fresh deployment doesn't backfill years of history.
+    //   - MONERO_RPC_URLS: comma-separated daemon RPC URLs. Defaults to a
+    //     curated public-node list; operators can override for a self-
+    //     hosted monerod or paid mirror.
+    moneroPrimaryAddress: z.string().optional(),
+    moneroViewKey: z.string().optional(),
+    moneroNetwork: z.enum(["mainnet", "stagenet", "testnet"]).default("mainnet"),
+    moneroRestoreHeight: z.coerce.number().int().nonnegative().default(0),
+    moneroRpcUrls: z.string().optional(),
+    // Optional. JSON object of HTTP headers (e.g. `{"api-key":"abc"}`)
+    // applied to every Monero daemon RPC request. Used by commercial
+    // providers (NOWNodes, Tatum). GetBlock-style URL-embedded keys do
+    // not need this.
+    moneroRpcHeadersJson: z.string().optional(),
+
     // DB
     databaseUrl: z.string().optional(),
     databaseToken: z.string().optional(),
@@ -220,6 +250,12 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     tronPollIntervalMs: env["TRON_POLL_INTERVAL_MS"],
     solanaRpcUrl: env["SOLANA_RPC_URL"],
     solanaNetwork: env["SOLANA_NETWORK"],
+    moneroPrimaryAddress: env["MONERO_PRIMARY_ADDRESS"],
+    moneroViewKey: env["MONERO_VIEW_KEY"],
+    moneroNetwork: env["MONERO_NETWORK"],
+    moneroRestoreHeight: env["MONERO_RESTORE_HEIGHT"],
+    moneroRpcUrls: env["MONERO_RPC_URLS"],
+    moneroRpcHeadersJson: env["MONERO_RPC_HEADERS_JSON"],
     gatewayPublicUrl: env["GATEWAY_PUBLIC_URL"],
     // Compulsory Turso post-2026-Q1; the env-var names reflect that.
     // DATABASE_URL / DATABASE_TOKEN are still honored as aliases so existing

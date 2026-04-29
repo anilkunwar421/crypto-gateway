@@ -101,7 +101,11 @@ export type PayoutErrorCode =
   | "TOP_UP_REVERTED"
   | "SOURCE_BROADCAST_FAILED"
   | "PAYOUT_NOT_FOUND"
-  | "PAYOUT_NOT_CANCELABLE";
+  | "PAYOUT_NOT_CANCELABLE"
+  // 400 — the requested payout's chain belongs to a family that doesn't
+  // support gateway-mediated outbound. Currently only Monero (v1 inbound-
+  // only); the operator settles XMR funds out-of-band via their own wallet.
+  | "PAYOUT_NOT_SUPPORTED_ON_FAMILY";
 
 // Codes whose failure reason originates from the chain RPC (not internal
 // gateway state). For these we PASS THROUGH the chain-reported message —
@@ -160,7 +164,8 @@ const MERCHANT_FACING_FAIL_MESSAGES: Readonly<Record<PayoutErrorCode, string>> =
   TOP_UP_REVERTED: "Gas top-up tx reverted on-chain.",
   SOURCE_BROADCAST_FAILED: "Main payout tx failed to broadcast.",
   PAYOUT_NOT_FOUND: "Payout not found.",
-  PAYOUT_NOT_CANCELABLE: "Payout cannot be canceled in its current status."
+  PAYOUT_NOT_CANCELABLE: "Payout cannot be canceled in its current status.",
+  PAYOUT_NOT_SUPPORTED_ON_FAMILY: "Payouts on this chain family are not supported."
 };
 
 const PAYOUT_ERROR_HTTP_STATUS: Readonly<Record<PayoutErrorCode, number>> = {
@@ -180,7 +185,8 @@ const PAYOUT_ERROR_HTTP_STATUS: Readonly<Record<PayoutErrorCode, number>> = {
   TOP_UP_REVERTED: 500,
   SOURCE_BROADCAST_FAILED: 500,
   PAYOUT_NOT_FOUND: 404,
-  PAYOUT_NOT_CANCELABLE: 409
+  PAYOUT_NOT_CANCELABLE: 409,
+  PAYOUT_NOT_SUPPORTED_ON_FAMILY: 400
 };
 
 export class PayoutError extends DomainError {
@@ -296,6 +302,17 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   }
 
   const chainAdapter = findChainAdapter(deps, parsed.chainId);
+  // Monero is inbound-only in v1 — the gateway holds the merchant's view
+  // key (sufficient for detection) but not the spend key, so it physically
+  // cannot sign outbound XMR txs. Operator settles funds out-of-band via
+  // their own wallet.
+  if (chainAdapter.family === "monero") {
+    throw new PayoutError(
+      "PAYOUT_NOT_SUPPORTED_ON_FAMILY",
+      "Monero payouts are not supported in v1. The operator settles XMR out-of-band " +
+      "via their own wallet (the gateway holds only the view key)."
+    );
+  }
   let destination: string;
   try {
     destination = chainAdapter.canonicalizeAddress(parsed.destinationAddress);
@@ -843,6 +860,17 @@ export async function estimatePayoutFees(
   }
 
   const chainAdapter = findChainAdapter(deps, parsed.chainId);
+  // Monero is inbound-only in v1 — the gateway holds the merchant's view
+  // key (sufficient for detection) but not the spend key, so it physically
+  // cannot sign outbound XMR txs. Operator settles funds out-of-band via
+  // their own wallet.
+  if (chainAdapter.family === "monero") {
+    throw new PayoutError(
+      "PAYOUT_NOT_SUPPORTED_ON_FAMILY",
+      "Monero payouts are not supported in v1. The operator settles XMR out-of-band " +
+      "via their own wallet (the gateway holds only the view key)."
+    );
+  }
   let destination: string;
   try {
     destination = chainAdapter.canonicalizeAddress(parsed.destinationAddress);
@@ -1301,6 +1329,7 @@ function nativeDecimalsForFamily(family: ChainFamily): number {
     case "tron": return 6;
     case "solana": return 9;
     case "utxo": return 8; // BTC + LTC both use 8 decimals (satoshis)
+    case "monero": return 12; // XMR — smallest unit is "piconero" (10⁻¹² XMR)
   }
 }
 

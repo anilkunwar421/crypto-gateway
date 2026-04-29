@@ -71,6 +71,7 @@ export const COINGECKO_DEFAULT_SYMBOL_MAP: Readonly<Record<string, string>> = {
   TRX: "tron",
   BTC: "bitcoin",
   LTC: "litecoin",
+  XMR: "monero",
   // Stablecoins
   USDC: "usd-coin",
   USDT: "tether",

@@ -294,6 +294,22 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     return { inserted: false };
   }
 
+  // Visibility: surface the successful ingest at info level. Without this,
+  // the success path is completely silent and operators tailing logs can't
+  // distinguish "didn't detect" from "detected and ingested cleanly". Cheap
+  // — at most one line per detected transfer, and only when something
+  // actually lands. Keep it tight: chainId + txHash + invoiceId(or "orphan")
+  // is enough to grep for in production triage.
+  deps.logger.info("ingest.success", {
+    chainId: transfer.chainId,
+    txHash: transfer.txHash,
+    logIndex: transfer.logIndex,
+    invoiceId: invoiceId ?? "orphan",
+    token: transfer.token,
+    amountRaw: transfer.amountRaw,
+    initialStatus
+  });
+
   // UTXO-family-only: also record the spendability overlay. The transactions
   // row is the source of truth for confirmation state; this `utxos` row is
   // the capital-management view (script_pubkey + address_index for sign time,

@@ -11,6 +11,18 @@ import {
   LITECOIN_CONFIG,
   utxoConfigForChainId
 } from "../adapters/chains/utxo/utxo-config.js";
+import { moneroChainAdapter } from "../adapters/chains/monero/monero-chain.adapter.js";
+import {
+  MONERO_MAINNET_CONFIG,
+  MONERO_STAGENET_CONFIG,
+  MONERO_TESTNET_CONFIG,
+  type MoneroChainConfig
+} from "../adapters/chains/monero/monero-config.js";
+import {
+  moneroDaemonRpcClient,
+  parseMoneroRpcUrlsEnv,
+  parseMoneroRpcHeadersEnv
+} from "../adapters/chains/monero/monero-rpc.js";
 import { loadBlockcypherChainConfigs } from "../adapters/detection/blockcypher-config.js";
 import { dbBlockcypherSubscriptionStore } from "../adapters/detection/blockcypher-subscription-store.js";
 import { makeBlockcypherSyncSweep } from "../adapters/detection/blockcypher-sync-sweep.js";
@@ -200,6 +212,73 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
   logger.info("UTXO chains wired", {
     chainIds: [BITCOIN_CONFIG.chainId, LITECOIN_CONFIG.chainId]
   });
+
+  // Monero (XMR) inbound wiring. Conditional on MONERO_PRIMARY_ADDRESS +
+  // MONERO_VIEW_KEY both being set. See node.ts for the full rationale.
+  // Pure-JS detection runs on Workers identically to Node — no native
+  // deps, no daemon binary required.
+  const moneroPrimary = typeof env["MONERO_PRIMARY_ADDRESS"] === "string"
+    ? env["MONERO_PRIMARY_ADDRESS"]
+    : undefined;
+  const moneroViewKeyHex = typeof env["MONERO_VIEW_KEY"] === "string"
+    ? env["MONERO_VIEW_KEY"]
+    : undefined;
+  if (moneroPrimary !== undefined && moneroViewKeyHex !== undefined && moneroPrimary.length > 0 && moneroViewKeyHex.length > 0) {
+    const networkRaw = typeof env["MONERO_NETWORK"] === "string" ? env["MONERO_NETWORK"] : "mainnet";
+    // Strict enum match — a typo like `MONERO_NETWORK=stagenet1` would
+    // otherwise silently boot mainnet and let the operator paste a
+    // stagenet wallet against the wrong adapter (parseAddress would
+    // reject it later, but we'd rather refuse here at boot).
+    if (networkRaw !== "mainnet" && networkRaw !== "stagenet" && networkRaw !== "testnet") {
+      throw new Error(
+        `MONERO_NETWORK must be one of "mainnet" | "stagenet" | "testnet"; got '${networkRaw}'`
+      );
+    }
+    const networkVal: "mainnet" | "stagenet" | "testnet" = networkRaw;
+    const moneroChain: MoneroChainConfig =
+      networkVal === "stagenet"
+        ? MONERO_STAGENET_CONFIG
+        : networkVal === "testnet"
+          ? MONERO_TESTNET_CONFIG
+          : MONERO_MAINNET_CONFIG;
+    const restoreHeightVal = typeof env["MONERO_RESTORE_HEIGHT"] === "string"
+      ? Number(env["MONERO_RESTORE_HEIGHT"])
+      : 0;
+    const restoreHeight = Number.isFinite(restoreHeightVal) && restoreHeightVal >= 0 ? restoreHeightVal : 0;
+    const rpcUrlsRaw = typeof env["MONERO_RPC_URLS"] === "string" ? env["MONERO_RPC_URLS"] : undefined;
+    const rpcUrls = parseMoneroRpcUrlsEnv(rpcUrlsRaw) ?? moneroChain.defaultRpcUrls;
+    // Optional auth headers applied to EVERY backend (not just one) — operators
+    // typically run a single commercial provider when they set this. Mixed
+    // public-and-paid setups should override `MONERO_RPC_URLS` to a single
+    // paid endpoint anyway, since the failover loop walks in order and the
+    // paid one will respond first.
+    const rpcHeadersRaw = typeof env["MONERO_RPC_HEADERS_JSON"] === "string" ? env["MONERO_RPC_HEADERS_JSON"] : undefined;
+    const rpcHeaders = parseMoneroRpcHeadersEnv(rpcHeadersRaw);
+    const viewKeyBytes = hexToBytes32(moneroViewKeyHex, "MONERO_VIEW_KEY");
+    chains.push(
+      moneroChainAdapter({
+        chain: moneroChain,
+        primaryAddress: moneroPrimary,
+        viewKey: viewKeyBytes,
+        restoreHeight,
+        daemonClient: moneroDaemonRpcClient({
+          backends: rpcUrls.map((u) => rpcHeaders ? { baseUrl: u, headers: rpcHeaders } : { baseUrl: u }),
+          logger
+        }),
+        cache,
+        logger
+      })
+    );
+    detectionStrategies[moneroChain.chainId] = rpcPollDetection();
+    logger.info("Monero adapter wired", {
+      chainId: moneroChain.chainId,
+      network: networkVal,
+      restoreHeight,
+      backendCount: rpcUrls.length,
+      // Header NAMES only — never log values; they're auth secrets.
+      authHeaderNames: rpcHeaders ? Object.keys(rpcHeaders) : []
+    });
+  }
 
   // Secrets-at-rest cipher. SECRETS_ENCRYPTION_KEY is REQUIRED in
   // production / staging — Workers don't run loadConfig the way node.ts
@@ -481,3 +560,21 @@ export default {
     }
   }
 };
+
+// Decode a 64-hex-char string into 32 bytes. Throws with a stable error
+// shape if the env var is the wrong length or has non-hex characters —
+// caught at boot rather than producing a silently-broken adapter.
+function hexToBytes32(hex: string, varName: string): Uint8Array {
+  const stripped = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (stripped.length !== 64) {
+    throw new Error(`${varName} must be 64 hex characters (32 bytes); got ${stripped.length}`);
+  }
+  if (!/^[0-9a-fA-F]+$/.test(stripped)) {
+    throw new Error(`${varName} contains non-hex characters`);
+  }
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i += 1) {
+    out[i] = parseInt(stripped.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}

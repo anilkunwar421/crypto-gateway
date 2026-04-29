@@ -39,6 +39,12 @@ export const CHAIN_REGISTRY: readonly ChainEntry[] = [
   { chainId: 801 as ChainId, slug: "litecoin", family: "utxo", displayName: "Litecoin" },
   { chainId: 802 as ChainId, slug: "bitcoin-testnet", family: "utxo", displayName: "Bitcoin Testnet3" },
   { chainId: 803 as ChainId, slug: "litecoin-testnet", family: "utxo", displayName: "Litecoin Testnet" },
+  // Monero (synthetic chainIds — Monero has no EVM-style id). Reserved range
+  // 1000-1099 leaves room for stagenet/testnet and any future privacy-coin
+  // additions in the same family bucket.
+  { chainId: 1000 as ChainId, slug: "monero", family: "monero", displayName: "Monero" },
+  { chainId: 1001 as ChainId, slug: "monero-stagenet", family: "monero", displayName: "Monero Stagenet" },
+  { chainId: 1002 as ChainId, slug: "monero-testnet", family: "monero", displayName: "Monero Testnet" },
   // Dev chain used by integration tests
   { chainId: 999 as ChainId, slug: "dev", family: "evm", displayName: "Dev Chain" }
 ];

@@ -401,8 +401,16 @@ function extractExtraPubkeys(extraBytes: readonly number[] | undefined): {
     }
     if (tag === 0x01) {
       if (i + 33 > extraBytes.length) break;
-      const slice = extraBytes.slice(i + 1, i + 33);
-      primary = slice.map((b) => b.toString(16).padStart(2, "0")).join("");
+      // Capture the FIRST 0x01 we encounter, not the last — matches the
+      // reference Monero `wallet2.cpp::parse_extra_pub_key` behavior.
+      // Standard wallets emit exactly one 0x01 tag per tx; multiple tags
+      // would be malformed, but if a custom/older wallet does emit them
+      // we want to use the canonical first one rather than an auxiliary
+      // pubkey that might be tacked on later in the buffer.
+      if (primary === null) {
+        const slice = extraBytes.slice(i + 1, i + 33);
+        primary = slice.map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
       i += 33;
       continue;
     }

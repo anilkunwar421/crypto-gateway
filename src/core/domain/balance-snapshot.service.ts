@@ -126,6 +126,7 @@ async function computeBalanceSnapshotDb(
   //    entirely when the pool is empty — `inArray(col, [])` is malformed SQL
   //    and a no-row result anyway.
   let creditRows: { address: string; chainId: number; token: string; amountRaw: string }[] = [];
+  let internalCreditRows: { address: string; chainId: number; token: string; amountRaw: string }[] = [];
   let debitRows: { address: string | null; chainId: number; token: string; amountRaw: string }[] = [];
   let reservationRows: { address: string; chainId: number; token: string; amountRaw: string }[] = [];
   if (allAddresses.length > 0) {
@@ -160,6 +161,28 @@ async function computeBalanceSnapshotDb(
       })
       .from(payouts)
       .where(and(...debitConds));
+
+    // 3b. Intra-pool credits. A confirmed `consolidation_sweep` moves token
+    //     between two pool addresses; the inbound watcher deliberately does
+    //     not re-ingest our own payout txs, so the destination pool address
+    //     is credited here off the payouts row (mirrors step 3's debit on
+    //     the source). Without this, a consolidation debits the source and
+    //     credits nothing — the swept balance disappears from the snapshot.
+    const internalCreditConds: SQL[] = [
+      eq(payouts.status, "confirmed"),
+      eq(payouts.kind, "consolidation_sweep"),
+      inArray(payouts.destinationAddress, allAddresses)
+    ];
+    if (opts.chainId !== undefined) internalCreditConds.push(eq(payouts.chainId, opts.chainId));
+    internalCreditRows = await deps.db
+      .select({
+        address: payouts.destinationAddress,
+        chainId: payouts.chainId,
+        token: payouts.token,
+        amountRaw: payouts.amountRaw
+      })
+      .from(payouts)
+      .where(and(...internalCreditConds));
 
     // 4. Active reservations (in-flight debits the operator should see as
     //    "spoken for, not available to spend"). Same shape as debits.
@@ -199,6 +222,18 @@ async function computeBalanceSnapshotDb(
   };
 
   for (const r of creditRows) {
+    if (!poolAddressSet.has(r.address)) continue;
+    if (opts.chainId !== undefined && opts.chainId !== r.chainId) continue;
+    const amount = BigInt(r.amountRaw);
+    if (amount <= 0n) continue;
+    const list = ensure(r.address, r.chainId);
+    const existing = list.find((e) => e.token === r.token);
+    if (existing) existing.amountRaw += amount;
+    else list.push({ token: r.token as TokenSymbol, amountRaw: amount });
+  }
+
+  // Intra-pool consolidation_sweep credits — same fold as inbound credits.
+  for (const r of internalCreditRows) {
     if (!poolAddressSet.has(r.address)) continue;
     if (opts.chainId !== undefined && opts.chainId !== r.chainId) continue;
     const amount = BigInt(r.amountRaw);
@@ -368,6 +403,13 @@ async function appendUtxoBalances(
 // Used by the payout source picker.
 //
 // Computation: confirmed inbound − confirmed outbound − active reservations.
+//   inbound  = confirmed `transactions` rows paid TO this address
+//            + confirmed `consolidation_sweep` payouts whose destination is
+//              this address (intra-pool token movement — the payout row is
+//              the canonical record; the inbound watcher deliberately does
+//              NOT also ingest it as a `transactions` row, so without this
+//              term a consolidation would debit the source and credit
+//              nothing, silently shrinking the ledger).
 // Negative results clamp to zero (a negative would mean we somehow paid out
 // funds we never observed arriving; treat as zero spendable until reconciled).
 //
@@ -384,7 +426,7 @@ export async function computeSpendable(
     "db" in depsOrDb ? (depsOrDb as AppDeps).db : depsOrDb;
   const { chainId, address, token } = args;
 
-  const [creditRowsRaw, debitRowsRaw, resRowsRaw] = await Promise.all([
+  const [creditRowsRaw, internalCreditRowsRaw, debitRowsRaw, resRowsRaw] = await Promise.all([
     db
       .select({ amountRaw: transactions.amountRaw })
       .from(transactions)
@@ -394,6 +436,22 @@ export async function computeSpendable(
           eq(transactions.toAddress, address),
           eq(transactions.chainId, chainId),
           eq(transactions.token, token)
+        )
+      ),
+    // Intra-pool credits: a confirmed consolidation_sweep moves token from
+    // one pool address to another. The inbound watcher skips re-ingesting
+    // our own payout txs (payout-self-detect guard), so the destination
+    // address only gets credited here, off the payouts row itself.
+    db
+      .select({ amountRaw: payouts.amountRaw })
+      .from(payouts)
+      .where(
+        and(
+          eq(payouts.status, "confirmed"),
+          eq(payouts.kind, "consolidation_sweep"),
+          eq(payouts.chainId, chainId),
+          eq(payouts.token, token),
+          sql`${payouts.destinationAddress} = ${address}`
         )
       ),
     db
@@ -422,6 +480,7 @@ export async function computeSpendable(
 
   let total = 0n;
   for (const r of creditRowsRaw) total += BigInt(r.amountRaw);
+  for (const r of internalCreditRowsRaw) total += BigInt(r.amountRaw);
   for (const r of debitRowsRaw) total -= BigInt(r.amountRaw);
   for (const r of resRowsRaw) total -= BigInt(r.amountRaw);
   return total < 0n ? 0n : total;

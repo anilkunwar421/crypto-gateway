@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isNull } from "drizzle-orm";
-import { computeSpendable } from "../../core/domain/balance-snapshot.service.js";
+import {
+  computeBalanceSnapshot,
+  computeSpendable
+} from "../../core/domain/balance-snapshot.service.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import { executeReservedPayouts, planPayout } from "../../core/domain/payout.service.js";
-import { payoutReservations } from "../../db/schema.js";
+import { payoutReservations, payouts } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 import { seedFundedPoolAddress } from "../helpers/seed-source.js";
 
@@ -82,5 +85,70 @@ describe("ledger-derived spendable balance", () => {
       .from(payoutReservations)
       .where(isNull(payoutReservations.releasedAt));
     expect(active.length).toBeGreaterThan(0);
+  });
+
+  // Regression: a confirmed consolidation_sweep must credit its DESTINATION.
+  // The inbound watcher skips re-ingesting our own payout txs (payout-self-
+  // detect guard), so without the payouts-table credit term the swept funds
+  // would debit the source and credit nothing — silently shrinking the
+  // ledger. See balance-snapshot.service.ts computeSpendable / step 3b.
+  it("credits the destination of a confirmed consolidation_sweep", async () => {
+    const adapter = booted.deps.chains.find((c) => c.family === "evm")!;
+    const TARGET_INDEX = 1_234_568;
+    const targetAddress = adapter.canonicalizeAddress(
+      adapter.deriveAddress(TEST_MASTER_SEED, TARGET_INDEX).address
+    );
+    // Target starts as a known pool address with zero balance.
+    await seedFundedPoolAddress(booted, {
+      chainId: 999,
+      family: "evm",
+      address: targetAddress,
+      derivationIndex: TARGET_INDEX,
+      balances: { DEV: "0" }
+    });
+
+    const now = booted.deps.clock.now().getTime();
+    await booted.deps.db.insert(payouts).values({
+      id: globalThis.crypto.randomUUID(),
+      merchantId: MERCHANT_ID,
+      kind: "consolidation_sweep",
+      status: "confirmed",
+      chainId: 999,
+      token: "DEV",
+      amountRaw: "400000",
+      destinationAddress: targetAddress,
+      sourceAddress,
+      txHash: `0x${globalThis.crypto.randomUUID().replace(/-/g, "")}`,
+      createdAt: now,
+      updatedAt: now,
+      confirmedAt: now
+    });
+
+    // Destination: 0 seeded + 400000 swept in.
+    const targetSpend = await computeSpendable(booted.deps, {
+      chainId: 999,
+      address: targetAddress,
+      token: "DEV"
+    });
+    expect(targetSpend.toString()).toBe("400000");
+
+    // Source: 1_000_000 inbound − 400000 swept out.
+    const sourceSpend = await computeSpendable(booted.deps, {
+      chainId: 999,
+      address: sourceAddress,
+      token: "DEV"
+    });
+    expect(sourceSpend.toString()).toBe((1_000_000n - 400_000n).toString());
+
+    // The db-mode snapshot must agree — the swept funds stay on the books,
+    // they just moved addresses (pool total is conserved).
+    const snap = await computeBalanceSnapshot(booted.deps, { chainId: 999 });
+    const addrRows = snap.families
+      .flatMap((f) => f.chains)
+      .flatMap((c) => c.addresses);
+    const targetRow = addrRows.find((a) => a.address === targetAddress);
+    const sourceRow = addrRows.find((a) => a.address === sourceAddress);
+    expect(targetRow?.tokens.find((t) => t.token === "DEV")?.amountRaw).toBe("400000");
+    expect(sourceRow?.tokens.find((t) => t.token === "DEV")?.amountRaw).toBe("600000");
   });
 });
